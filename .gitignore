@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# C build
+lut_tool
+*.o
+*.obj
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+LutScope
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# Results (keep dir, ignore content)
+results/*
+!results/.gitkeep
+
+# Test images (user-provided)
+test_images/*
+!test_images/.gitkeep
+
+# LUTs (user-provided)
+luts/*
+!luts/.gitkeep

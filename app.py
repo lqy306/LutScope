@@ -1,0 +1,1240 @@
+#!/usr/bin/env python3
+"""
+LutScope — 3D LUT 风格评估与自然语言查询工具
+=============================================
+兼容所有 OpenAI API 格式的提供商
+
+环境变量:
+    OPENAI_API_KEY    — API 密钥 (必需, 或用 --api-key)
+    OPENAI_BASE_URL   — API 地址 (默认 https://api.openai.com/v1)
+    OPENAI_MODEL      — 模型名 (默认 gpt-4o)
+
+用法:
+    python app.py                                # 启动 TUI
+    python app.py --cli --image photo.jpg        # CLI 评估
+    python app.py --cli --query "德味 复古"       # 评估+风格查询
+    python app.py --cli --interactive             # 交互式查询
+
+依赖 (运行时可缺失, 部分功能降级):
+    Pillow        — 图像处理 (pip install Pillow)
+    requests      — API 调用 (pip install requests)
+"""
+
+import os
+import sys
+import json
+import time
+import re
+import curses
+import curses.textpad
+import argparse
+import zipfile
+import tempfile
+import shutil
+from typing import Optional, List, Tuple
+
+# ============================================================
+#  Zipapp / 单文件运行时支持
+# ============================================================
+
+_LUT_BINARY_CACHE = None
+
+
+def find_lut_tool() -> str:
+    """查找 lut_tool 二进制: 源码 / zipapp / PATH。"""
+    global _LUT_BINARY_CACHE
+    if _LUT_BINARY_CACHE and os.path.exists(_LUT_BINARY_CACHE):
+        return _LUT_BINARY_CACHE
+
+    # 当前目录
+    if os.path.exists("./lut_tool"):
+        _LUT_BINARY_CACHE = os.path.abspath("./lut_tool")
+        return _LUT_BINARY_CACHE
+
+    # 脚本同级目录
+    d = os.path.dirname(os.path.abspath(__file__))
+    c = os.path.join(d, "lut_tool")
+    if os.path.exists(c):
+        _LUT_BINARY_CACHE = c
+        return _LUT_BINARY_CACHE
+
+    # zipapp 内提取
+    if (not __file__.endswith(".py") or
+            (os.path.isfile(sys.argv[0]) and ".pyz" in sys.argv[0])):
+        try:
+            td = os.path.join(tempfile.gettempdir(), "LutScope")
+            os.makedirs(td, exist_ok=True)
+            lp = os.path.join(td, "lut_tool")
+            if not os.path.exists(lp):
+                with zipfile.ZipFile(sys.argv[0]) as z:
+                    z.extract("lut_tool", td)
+                os.chmod(lp, 0o755)
+            _LUT_BINARY_CACHE = lp
+            return lp
+        except Exception:
+            pass
+
+    return "./lut_tool"
+
+
+# ============================================================
+#  ANSI / curses 工具
+# ============================================================
+
+# ============================================================
+#  导入核心引擎
+# ============================================================
+try:
+    from engine import (
+        LutEntry, EvalResult, ColorStats,
+        discover_luts, extract_cube, discover_test_image,
+        convert_to_ppm, add_watermark,
+        run_lut_tool, extract_color_stats, stats_diff, stats_to_text,
+        run_pipeline, format_result_summary, export_results_json,
+        check_api_key, get_api_config, DEFAULT_MODEL, DEFAULT_API_URL,
+        match_query, format_query_result,
+    )
+    HAS_ENGINE = True
+except ImportError:
+    HAS_ENGINE = False
+
+
+# ============================================================
+#  ANSI / curses 工具
+# ============================================================
+
+# 颜色对索引
+C_HEADER   = 1
+C_FOOTER   = 2
+C_TITLE    = 3
+C_OK       = 4
+C_ERROR    = 5
+C_HIGHLIGHT = 6
+C_MUTED    = 7
+C_MEDAL_1  = 8
+C_MEDAL_2  = 9
+C_MEDAL_3  = 10
+C_BAR      = 11
+C_LABEL    = 12
+
+def cpad(text: str, width: int) -> str:
+    """居中对齐 + 填充空格。"""
+    if len(text) >= width:
+        return text[:width]
+    left = (width - len(text)) // 2
+    return " " * left + text + " " * (width - left - left)
+
+def trunc(text: str, max_w: int) -> str:
+    """截断文本并加 ..."""
+    if len(text) <= max_w:
+        return text
+    return text[:max_w - 3] + "..."
+
+def draw_box(win, y: int, x: int, h: int, w: int, title: str = ""):
+    """绘制带边框的盒子。"""
+    win.addch(y, x, curses.ACS_ULCORNER)
+    win.hline(y, x + 1, curses.ACS_HLINE, w - 2)
+    win.addch(y, x + w - 1, curses.ACS_URCORNER)
+    for row in range(y + 1, y + h - 1):
+        win.addch(row, x, curses.ACS_VLINE)
+        win.addch(row, x + w - 1, curses.ACS_VLINE)
+    win.addch(y + h - 1, x, curses.ACS_LLCORNER)
+    win.hline(y + h - 1, x + 1, curses.ACS_HLINE, w - 2)
+    win.addch(y + h - 1, x + w - 1, curses.ACS_LRCORNER)
+    if title:
+        win.addstr(y, x + 2, f" {title} ")
+
+
+# ============================================================
+#  TUI 应用
+# ============================================================
+
+class LutTUI:
+    """LUT 评估 TUI 主应用 (curses)。"""
+
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.screen = "main"  # main | processing | results | settings
+
+        # 数据
+        self.luts: List[LutEntry] = []
+        self.lut_filter: str = ""         # LUT 正则过滤器
+        self.test_image: Optional[str] = None
+        self.output_dir = "./results"
+        self.lut_dir = "."
+        self.lut_tool_path = find_lut_tool()
+        self.results: List[EvalResult] = []
+        self.best_lut = ""
+        self.best_reason = ""
+        self.watermarked_images: List[str] = []
+
+        # API 配置 (可从环境变量覆盖, TUI 内也可编辑)
+        self.api_key, self.api_base_url, self.api_model = get_api_config()
+
+        # 导出设置
+        self.auto_export: bool = True
+        self.export_path: str = ""
+
+        # 处理状态
+        self.progress_msg = ""
+        self.progress_pct = 0.0
+        self.processing_done = False
+        self.processing_error = ""
+        self.running = True
+
+        # 终端尺寸
+        self.h, self.w = 0, 0
+
+    # ----------------------------------------------------------
+    #  curses 初始化
+    # ----------------------------------------------------------
+
+    def setup_colors(self):
+        """初始化颜色对。"""
+        curses.start_color()
+        curses.use_default_colors()
+
+        # 颜色对: (id, fg, bg)
+        pairs = [
+            (C_HEADER,    curses.COLOR_WHITE,   curses.COLOR_BLUE),
+            (C_FOOTER,    curses.COLOR_WHITE,   curses.COLOR_BLUE),
+            (C_TITLE,     curses.COLOR_YELLOW,  -1),
+            (C_OK,        curses.COLOR_GREEN,   -1),
+            (C_ERROR,     curses.COLOR_RED,     -1),
+            (C_HIGHLIGHT, curses.COLOR_YELLOW,  -1),
+            (C_MUTED,     curses.COLOR_CYAN,    -1),
+            (C_MEDAL_1,   curses.COLOR_YELLOW,  -1),
+            (C_MEDAL_2,   curses.COLOR_WHITE,   -1),
+            (C_MEDAL_3,   curses.COLOR_RED,     -1),
+            (C_BAR,       curses.COLOR_GREEN,   -1),
+            (C_LABEL,     curses.COLOR_MAGENTA, -1),
+        ]
+        for pid, fg, bg in pairs:
+            try:
+                curses.init_pair(pid, fg, bg if bg != -1 else -1)
+            except Exception:
+                curses.init_pair(pid, fg, curses.COLOR_BLACK)
+
+    # ----------------------------------------------------------
+    #  绘制: 通用组件
+    # ----------------------------------------------------------
+
+    def draw_header(self, title: str = "  LUT 风格评估工具  "):
+        """绘制顶部标题栏。"""
+        self.w, self.h = curses.COLS, curses.LINES  # 注意: curses 坐标是 (y, x)
+        # 在 curses 中: COLS=宽, LINES=高
+        curses.update_lines_cols()
+        self.w = curses.COLS
+        self.h = curses.LINES
+
+        attr = curses.color_pair(C_HEADER) | curses.A_BOLD
+        bar = " " * self.w
+        try:
+            self.stdscr.addstr(0, 0, bar, attr)
+            pad = max(0, self.w - len(title))
+            x = pad // 2
+            self.stdscr.addstr(0, x, title, attr)
+        except curses.error:
+            pass
+
+    def draw_footer(self, items: List[Tuple[str, str]]):
+        """绘制底部菜单栏。 items: [(key, label), ...]"""
+        attr = curses.color_pair(C_FOOTER) | curses.A_BOLD
+        y = self.h - 1
+        bar = " " * self.w
+        try:
+            self.stdscr.addstr(y, 0, bar, attr)
+            left = 1
+            for key, label in items:
+                text = f" [{key}] {label} "
+                self.stdscr.addstr(y, left, text, attr)
+                left += len(text) + 2
+        except curses.error:
+            pass
+
+    def draw_status_bar(self, text: str, y: int = None):
+        """在指定行绘制状态条。"""
+        if y is None:
+            y = self.h - 2
+        attr = curses.color_pair(C_MUTED)
+        try:
+            self.stdscr.addstr(y, 0, " " * self.w, attr)
+            self.stdscr.addstr(y, 1, trunc(text, self.w - 3), attr)
+        except curses.error:
+            pass
+
+    def draw_progress_bar(self, y: int, x: int, w: int, pct: float):
+        """绘制进度条。"""
+        if w < 10:
+            return
+        bar_w = w - 8
+        filled = int(bar_w * pct / 100.0)
+        empty = bar_w - filled
+
+        try:
+            self.stdscr.addstr(y, x, f"[", curses.color_pair(C_MUTED))
+            self.stdscr.addstr(y, x + 1,
+                               "█" * filled,
+                               curses.color_pair(C_BAR) | curses.A_BOLD)
+            self.stdscr.addstr(y, x + 1 + filled,
+                               "░" * empty,
+                               curses.color_pair(C_MUTED))
+            self.stdscr.addstr(y, x + 1 + bar_w,
+                               f"] {pct:.0f}%",
+                               curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+    def draw_list_item(self, y: int, x: int, text: str,
+                       selected: bool = False, indent: int = 2):
+        """绘制列表项。"""
+        prefix = "  " * indent
+        attr = curses.A_NORMAL
+        if selected:
+            attr = curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD
+        try:
+            self.stdscr.addstr(y, x, f"{prefix}{trunc(text, self.w - x - 4)}", attr)
+        except curses.error:
+            pass
+
+    # ----------------------------------------------------------
+    #  绘制: 主屏幕
+    # ----------------------------------------------------------
+
+    def draw_main_screen(self):
+        """主屏幕: LUT 列表 + 配置 + 操作按钮。"""
+        self.stdscr.clear()
+
+        # 常量区域
+        HEADER_H = 1
+        FOOTER_H = 1
+        PADDING = 1
+        y = HEADER_H + PADDING
+
+        # -- 测试图信息 --
+        img_text = self.test_image or "未发现 (将扫描)"
+        pair = curses.color_pair(C_OK) if self.test_image else curses.A_NORMAL
+        try:
+            self.stdscr.addstr(y, 2, "📁 测试图:", curses.A_BOLD)
+            self.stdscr.addstr(y, 14, trunc(img_text, self.w - 16), pair)
+        except curses.error:
+            pass
+        y += 1
+
+        # -- API 状态 --
+        key_ok, key_info = check_api_key()
+        api_text = f"🔑 {key_info}" if key_ok else "🔑 API Key 未设置 (将使用本地分析)"
+        api_attr = curses.color_pair(C_OK) if key_ok else curses.color_pair(C_ERROR)
+        try:
+            self.stdscr.addstr(y, 2, api_text, api_attr)
+        except curses.error:
+            pass
+        y += 1
+
+        # 显示 base_url 和 model
+        try:
+            self.stdscr.addstr(y, 4,
+                               f"URL: {trunc(self.api_base_url, 45)}",
+                               curses.color_pair(C_MUTED))
+            self.stdscr.addstr(y, 55, f"Model: {self.api_model}",
+                               curses.color_pair(C_MUTED))
+        except curses.error:
+            pass
+        y += 2
+
+        # -- LUT 筛选输入 --
+        try:
+            self.stdscr.addstr(y, 2, "🔍 筛选: ", curses.A_BOLD)
+            filter_display = self.lut_filter if self.lut_filter else "(正则, 按 F 输入)"
+            self.stdscr.addstr(y, 12, filter_display,
+                               curses.color_pair(C_HIGHLIGHT) if self.lut_filter
+                               else curses.color_pair(C_MUTED))
+        except curses.error:
+            pass
+        y += 1
+
+        # -- LUT 列表 (已筛选) --
+        filtered = self.luts
+        if self.lut_filter:
+            try:
+                pat = re.compile(self.lut_filter, re.IGNORECASE)
+                filtered = [l for l in self.luts if pat.search(l.name)]
+            except re.error:
+                pass  # 正则出错时显示全部
+
+        if self.luts:
+            title = f"📦 发现的 LUT ({len(filtered)}/{len(self.luts)} 个):"
+            try:
+                self.stdscr.addstr(y, 2, title, curses.A_BOLD)
+            except curses.error:
+                pass
+            y += 1
+
+            max_display = min(len(filtered), self.h - y - 8)
+            for i in range(max_display):
+                lut = filtered[i]
+                src = f" (来自 {os.path.basename(lut.zip_path)})" if lut.from_zip else ""
+                try:
+                    self.stdscr.addstr(y, 4, f" ✓  ", curses.color_pair(C_OK))
+                    self.stdscr.addstr(y, 9, trunc(lut.name, 30), curses.A_BOLD)
+                    self.stdscr.addstr(y, 42, src, curses.color_pair(C_MUTED))
+                except curses.error:
+                    pass
+                y += 1
+
+            if len(filtered) > max_display:
+                try:
+                    self.stdscr.addstr(y, 4,
+                                       f"... 还有 {len(filtered) - max_display} 个",
+                                       curses.color_pair(C_MUTED))
+                except curses.error:
+                    pass
+                y += 1
+        else:
+            try:
+                self.stdscr.addstr(y, 2, "📦 未发现 LUT 文件", curses.color_pair(C_ERROR))
+            except curses.error:
+                pass
+            y += 1
+
+        # -- 扫描按钮提示 --
+        y += 1
+        try:
+            self.stdscr.addstr(y, 2, "[R]重扫 [F]筛选 [C]清除筛选 [1]评估",
+                               curses.color_pair(C_HIGHLIGHT))
+        except curses.error:
+            pass
+
+        # -- 结果区 (如果有之前的评估结果) --
+        if self.results:
+            y = self.h - 6
+            try:
+                self.stdscr.addstr(y, 2, "上次评估结果:", curses.A_BOLD)
+                y += 1
+                self.stdscr.addstr(y, 4,
+                                   f"🏆 最佳: {self.best_lut}",
+                                   curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD)
+                best = self.results[0] if self.results else None
+                if best:
+                    y += 1
+                    tags = ", ".join(best.style_tags)
+                    self.stdscr.addstr(y, 6,
+                                       f"评分: {best.score:.0f}/100  标签: {tags}",
+                                       curses.color_pair(C_OK))
+            except curses.error:
+                pass
+
+        # -- 底部 --
+        self.draw_header()
+        self.draw_footer([
+            ("1", "开始评估"),
+            ("2", "⚙️ 设置"),
+            ("3", "导出 JSON"),
+            ("R", "扫描"),
+            ("Q", "退出"),
+        ])
+        self.stdscr.refresh()
+
+    # ----------------------------------------------------------
+    #  绘制: 设置界面
+    # ----------------------------------------------------------
+
+    def draw_settings_screen(self):
+        """配置界面 — 支持在 TUI 内编辑 API 设置、路径等。"""
+        self.stdscr.clear()
+        self.draw_header("  ⚙️ 设置  ")
+        y = 3
+
+        # 可编辑字段列表: (标签, 变量名, 当前值, 提示)
+        fields = [
+            ("API Key",     self.api_key,      "输入 API Key"),
+            ("API Base URL", self.api_base_url, "如 https://api.openai.com/v1"),
+            ("Model",       self.api_model,    "如 gpt-4o / deepseek-chat"),
+            ("LUT 目录",    self.lut_dir,      "如 ./luts"),
+            ("输出目录",    self.output_dir,   "如 ./results"),
+            ("自动导出",    "是" if self.auto_export else "否", "开关"),
+        ]
+
+        try:
+            self.stdscr.addstr(y, 2, "按数字键编辑对应字段:", curses.A_BOLD)
+        except curses.error:
+            pass
+        y += 2
+
+        for i, (label, val, hint) in enumerate(fields):
+            prefix = f" [{i+1}] "
+            label_w = 16
+            val_text = trunc(str(val), max(20, self.w - label_w - 12))
+            try:
+                self.stdscr.addstr(y, 2, prefix, curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD)
+                self.stdscr.addstr(y, 7, label.ljust(label_w), curses.color_pair(C_LABEL))
+                self.stdscr.addstr(y, 7 + label_w, val_text, curses.A_BOLD)
+            except curses.error:
+                pass
+            y += 1
+
+        # 当前 API 状态
+        y += 2
+        api_key_for_check = self.api_key or os.environ.get("OPENAI_API_KEY", "")
+        if api_key_for_check and self.api_base_url:
+            status = f"🔑 API 可用 → {trunc(self.api_base_url.replace('https://',''), 30)} | {self.api_model}"
+            attr = curses.color_pair(C_OK)
+        else:
+            status = "⚠️  API 未配置完整 (将使用本地分析)"
+            attr = curses.color_pair(C_ERROR)
+        try:
+            self.stdscr.addstr(y, 2, status, attr)
+        except curses.error:
+            pass
+        y += 2
+
+        # 操作提示
+        try:
+            self.stdscr.addstr(y, 2, "操作说明: 按 1-6 编辑, ENTER 确认, ESC 返回",
+                               curses.color_pair(C_MUTED))
+        except curses.error:
+            pass
+
+        self.draw_footer([
+            ("1-6", "编辑字段"),
+            ("R", "重置为环境变量"),
+            ("ESC", "返回"),
+            ("X", "退出"),
+        ])
+        self.stdscr.refresh()
+
+    def _edit_field(self, prompt: str, current: str, field_w: int = 50) -> Optional[str]:
+        """通用 TUI 文本输入。"""
+        # 输入框居中
+        box_w = min(field_w, self.w - 8)
+        box_h = 3
+        y0 = self.h // 2 - 2
+        x0 = (self.w - box_w) // 2
+
+        win = curses.newwin(box_h, box_w, y0, x0)
+        win.bkgd(' ', curses.A_NORMAL)
+        win.erase()
+
+        # 边框
+        win.addch(0, 0, curses.ACS_ULCORNER)
+        win.hline(0, 1, curses.ACS_HLINE, box_w - 2)
+        win.addch(0, box_w - 1, curses.ACS_URCORNER)
+        win.addch(2, 0, curses.ACS_LLCORNER)
+        win.hline(2, 1, curses.ACS_HLINE, box_w - 2)
+        win.addch(2, box_w - 1, curses.ACS_LRCORNER)
+
+        if len(prompt) > box_w - 2:
+            prompt_display = prompt[:box_w - 5] + "..."
+        else:
+            prompt_display = prompt
+        win.addstr(0, 2, f" {prompt_display} ", curses.color_pair(C_HIGHLIGHT))
+        win.refresh()
+
+        curses.curs_set(1)
+
+        # 输入
+        edit_win = curses.newwin(1, box_w - 2, y0 + 1, x0 + 1)
+        if current:
+            edit_win.addstr(0, 0, current)
+        edit_box = curses.textpad.Textbox(edit_win)
+        edit_win.refresh()
+        result = edit_box.edit().strip()
+
+        curses.curs_set(0)
+        self.stdscr.touchwin()
+        self.stdscr.refresh()
+
+        return result if result else None
+
+    # ----------------------------------------------------------
+    #  绘制: 处理进度
+    # ----------------------------------------------------------
+
+    def draw_processing_screen(self):
+        """处理进度界面。"""
+        self.stdscr.clear()
+        self.draw_header("  处理中...  ")
+
+        y = 3
+        try:
+            self.stdscr.addstr(y, 2, self.progress_msg or "准备中...",
+                               curses.A_BOLD)
+        except curses.error:
+            pass
+        y += 2
+
+        # 整体进度条
+        self.draw_progress_bar(y, 4, self.w - 8, self.progress_pct)
+
+        y += 2
+        if self.processing_error:
+            try:
+                self.stdscr.addstr(y, 2, f"错误: {self.processing_error}",
+                                   curses.color_pair(C_ERROR))
+            except curses.error:
+                pass
+        elif self.processing_done:
+            try:
+                self.stdscr.addstr(y, 2, "✅ 处理完成! 按任意键查看结果...",
+                                   curses.color_pair(C_OK) | curses.A_BOLD)
+            except curses.error:
+                pass
+        else:
+            try:
+                self.stdscr.addstr(y, 2, "⏳ 正在处理 LUT... 按 [Q] 取消",
+                                   curses.color_pair(C_MUTED))
+            except curses.error:
+                pass
+
+        self.draw_footer([
+            ("Q", "取消 / 返回"),
+        ])
+        self.stdscr.refresh()
+
+    # ----------------------------------------------------------
+    #  绘制: 结果界面
+    # ----------------------------------------------------------
+
+    def draw_results_screen(self):
+        """评估结果界面。"""
+        self.stdscr.clear()
+        self.draw_header("  评估结果  ")
+
+        y = 2
+        if not self.results:
+            try:
+                self.stdscr.addstr(y, 2, "暂无评估结果。", curses.color_pair(C_ERROR))
+            except curses.error:
+                pass
+            self.draw_footer([
+                ("ESC", "返回"),
+                ("Q", "退出"),
+            ])
+            self.stdscr.refresh()
+            return
+
+        # 最佳 LUT
+        try:
+            self.stdscr.addstr(y, 2, f"🏆  最佳 LUT: {self.best_lut}",
+                               curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD)
+        except curses.error:
+            pass
+        y += 1
+        if self.best_reason:
+            try:
+                self.stdscr.addstr(y, 4, trunc(self.best_reason, self.w - 10),
+                                   curses.color_pair(C_OK))
+            except curses.error:
+                pass
+            y += 1
+        y += 1
+
+        # 排名表
+        try:
+            # 表头
+            self.stdscr.addstr(y, 2, "排名  LUT", curses.A_UNDERLINE | curses.A_BOLD)
+            self.stdscr.addstr(y, 30, "评分", curses.A_UNDERLINE | curses.A_BOLD)
+            self.stdscr.addstr(y, 36, "风格标签", curses.A_UNDERLINE | curses.A_BOLD)
+        except curses.error:
+            pass
+        y += 1
+
+        medals = ["🥇", "🥈", "🥉"]
+        medal_colors = [C_MEDAL_1, C_MEDAL_2, C_MEDAL_3]
+
+        max_display = min(len(self.results), self.h - y - 5)
+        for i in range(max_display):
+            r = self.results[i]
+            medal = medals[i] if i < 3 else f"{i+1:2d}"
+            mc = medal_colors[i] if i < 3 else curses.A_NORMAL
+            tags = ", ".join(r.style_tags[:3])
+            try:
+                self.stdscr.addstr(y, 2, f" {medal}  ", curses.color_pair(mc) | curses.A_BOLD)
+                self.stdscr.addstr(y, 9, trunc(r.name, 20), curses.A_BOLD)
+                score_attr = curses.color_pair(C_OK) if r.score >= 70 else \
+                             curses.color_pair(C_HIGHLIGHT) if r.score >= 50 else \
+                             curses.color_pair(C_ERROR)
+                self.stdscr.addstr(y, 30, f"{r.score:3.0f}", score_attr)
+                self.stdscr.addstr(y, 36, trunc(tags, self.w - 38))
+            except curses.error:
+                pass
+            y += 1
+
+        # 选中某个 LUT 查看详情
+        if max_display > 0:
+            y = max(y, self.h - 6)
+            try:
+                self.stdscr.addstr(y, 2, "按 [1-9] 查看对应 LUT 详情",
+                                   curses.color_pair(C_MUTED))
+            except curses.error:
+                pass
+
+        # 导出提示
+        try:
+            self.stdscr.addstr(self.h - 4, 2,
+                               "水印图已保存至: " + trunc(self.output_dir, self.w - 22),
+                               curses.color_pair(C_MUTED))
+        except curses.error:
+            pass
+
+        self.draw_footer([
+            ("ESC", "返回主屏"),
+            ("E", "导出 JSON"),
+            ("Q", "查风格"),
+            ("R", "重新评估"),
+            ("X", "退出"),
+        ])
+        self.stdscr.refresh()
+
+    # ----------------------------------------------------------
+    #  绘制: LUT 详情弹窗
+    # ----------------------------------------------------------
+
+    def show_lut_detail(self, idx: int):
+        """在结果界面显示某个 LUT 的详细分析。"""
+        if idx < 0 or idx >= len(self.results):
+            return
+        r = self.results[idx]
+
+        h, w = 14, 60
+        y0 = (self.h - h) // 2
+        x0 = (self.w - w) // 2
+        win = curses.newwin(h, w, y0, x0)
+        win.bkgd(' ', curses.color_pair(C_HEADER))
+        win.erase()
+        draw_box(win, 0, 0, h, w, f" {r.name} 详情 ")
+
+        try:
+            # 评分
+            win.addstr(2, 2, f"评分: {r.score:.0f}/100",
+                       curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD)
+            # 标签
+            tags = ", ".join(r.style_tags)
+            win.addstr(3, 2, f"风格: {tags}", curses.color_pair(C_OK))
+            # 描述
+            win.addstr(4, 2, "描述:", curses.A_BOLD)
+            desc = r.description
+            for i in range(0, len(desc), w - 6):
+                win.addstr(5 + i // (w - 6), 4,
+                           trunc(desc[i:i + w - 6], w - 6))
+            # 分析
+            analysis_y = 7 if len(desc) <= w - 6 else 6
+            win.addstr(analysis_y, 2, "分析:", curses.A_BOLD)
+            ana = r.analysis
+            max_lines = h - analysis_y - 3
+            for i in range(max_lines):
+                start = i * (w - 6)
+                if start >= len(ana):
+                    break
+                win.addstr(analysis_y + 1 + i, 4,
+                           trunc(ana[start:start + w - 6], w - 6))
+
+            # 底部提示
+            win.addstr(h - 1, 2, "按任意键关闭",
+                       curses.color_pair(C_MUTED))
+
+        except curses.error:
+            pass
+
+        win.refresh()
+        win.getch()
+        del win
+        self.stdscr.touchwin()
+        self.stdscr.refresh()
+
+    # ----------------------------------------------------------
+    #  处理逻辑 (非阻塞)
+    # ----------------------------------------------------------
+
+    def run_scan(self):
+        """扫描 LUT 和测试图。"""
+        self.luts = discover_luts(self.lut_dir)
+        self.test_image = discover_test_image()
+
+    def run_full_pipeline(self, luts_to_process=None):
+        """完整处理管线。"""
+        target_luts = luts_to_process if luts_to_process else self.luts
+        if not target_luts or not self.test_image:
+            self.processing_error = "LUT 或测试图未就绪"
+            self.screen = "processing"
+            return
+
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        def progress_cb(msg: str, pct: float):
+            self.progress_msg = msg
+            self.progress_pct = pct
+            self.draw_processing_screen()
+
+        self.progress_msg = "处理中..."
+        self.progress_pct = 0.0
+        self.processing_error = ""
+        self.processing_done = False
+
+        # 获取 API 配置 (TUI 内设置优先于环境变量)
+        api_key = self.api_key or os.environ.get("OPENAI_API_KEY", "")
+
+        results, best_lut, best_reason, images = run_pipeline(
+            lut_tool_path=self.lut_tool_path,
+            test_image_path=self.test_image,
+            output_dir=self.output_dir,
+            luts=target_luts,
+            api_key=api_key,
+            model=self.api_model,
+            base_url=self.api_base_url,
+            progress_cb=progress_cb,
+        )
+
+        self.results = results
+        self.best_lut = best_lut
+        self.best_reason = best_reason
+        self.watermarked_images = images
+        self.processing_done = True
+        self.processing_error = ""
+
+        # 自动导出
+        if self.auto_export and results:
+            out_path = os.path.join(self.output_dir, "eval_result.json")
+            try:
+                export_results_json(results, best_lut, best_reason, out_path)
+                self.export_path = out_path
+            except Exception:
+                pass
+
+        if not results:
+            self.processing_error = "处理失败: 请检查日志"
+
+    # ----------------------------------------------------------
+    #  事件循环
+    # ----------------------------------------------------------
+
+    def handle_main_key(self, key):
+        """主屏幕按键处理。"""
+        if key == ord('q') or key == ord('Q'):
+            self.running = False
+        elif key == ord('1'):
+            # 使用已筛选的 LUT
+            luts_to_process = self._get_filtered_luts()
+            if luts_to_process and self.test_image:
+                self.screen = "processing"
+                self.run_full_pipeline(luts_to_process)
+                if self.processing_done:
+                    if self.results:
+                        self.screen = "results"
+                    else:
+                        self.screen = "main"
+                else:
+                    self.screen = "main"
+            else:
+                if not self.test_image:
+                    self.run_scan()
+        elif key == ord('2'):
+            self.screen = "settings"
+        elif key == ord('3'):
+            self.export_json()
+        elif key == ord('r') or key == ord('R'):
+            self.run_scan()
+        elif key == ord('f') or key == ord('F'):
+            # 输入筛选正则
+            new_filter = self._edit_field("正则筛选 (如: sepia|blue|mono)", self.lut_filter, 50)
+            if new_filter is not None:
+                self.lut_filter = new_filter
+        elif key == ord('c') or key == ord('C'):
+            self.lut_filter = ""
+
+    def _get_filtered_luts(self) -> List:
+        """返回当前筛选后的 LUT 列表。"""
+        if not self.lut_filter:
+            return self.luts
+        try:
+            pat = re.compile(self.lut_filter, re.IGNORECASE)
+            return [l for l in self.luts if pat.search(l.name)]
+        except re.error:
+            return self.luts
+
+    def handle_settings_key(self, key):
+        """设置屏幕按键处理。"""
+        if key == 27:  # ESC
+            self.screen = "main"
+        elif key == ord('q') or key == ord('Q'):
+            self.running = False
+        elif key == ord('x') or key == ord('X'):
+            self.running = False
+        elif key == ord('r') or key == ord('R'):
+            # 重置为环境变量
+            self.api_key, self.api_base_url, self.api_model = get_api_config()
+        elif ord('1') <= key <= ord('6'):
+            idx = key - ord('1')
+            fields = [
+                ("API Key", self.api_key),
+                ("API Base URL", self.api_base_url),
+                ("Model", self.api_model),
+                ("LUT 目录", self.lut_dir),
+                ("输出目录", self.output_dir),
+                ("自动导出", "y" if self.auto_export else "n"),
+            ]
+            if idx < len(fields):
+                label, val = fields[idx]
+                if idx == 5:  # 自动导出 — 开关
+                    self.auto_export = not self.auto_export
+                else:
+                    hints = ["sk-...", "https://...", "model name", "./luts", "./results", ""]
+                    new_val = self._edit_field(label, str(val), 50)
+                    if new_val is not None:
+                        if idx == 0:
+                            self.api_key = new_val
+                        elif idx == 1:
+                            self.api_base_url = new_val
+                        elif idx == 2:
+                            self.api_model = new_val
+                        elif idx == 3:
+                            self.lut_dir = new_val
+                        elif idx == 4:
+                            self.output_dir = new_val
+
+    def handle_processing_key(self, key):
+        """处理屏幕按键处理。"""
+        if key == ord('q') or key == ord('Q'):
+            if not self.processing_done:
+                # 无法真正取消，标记后返回
+                pass
+            self.screen = "main"
+        if key == 27:  # ESC
+            self.screen = "main"
+
+    def handle_results_key(self, key):
+        """结果屏幕按键处理。"""
+        if key == 27:  # ESC
+            self.screen = "main"
+        elif key == ord('q') or key == ord('Q'):
+            self.screen = "query"
+        elif key == ord('e') or key == ord('E'):
+            self.export_json()
+        elif key == ord('r') or key == ord('R'):
+            if self.luts and self.test_image:
+                self.processing_done = False
+                self.screen = "processing"
+                self.run_full_pipeline()
+                if self.processing_done:
+                    self.screen = "results" if self.results else "main"
+                else:
+                    self.screen = "main"
+        elif ord('1') <= key <= ord('9'):
+            idx = key - ord('1')
+            if idx < len(self.results):
+                self.show_lut_detail(idx)
+
+    def draw_query_screen(self):
+        """自然语言查询界面。"""
+        self.stdscr.clear()
+        self.draw_header("  💬 风格查询  ")
+
+        y = 3
+        try:
+            self.stdscr.addstr(y, 2, "输入风格描述，AI 将匹配最合适的 LUT:",
+                               curses.A_BOLD)
+            y += 2
+            self.stdscr.addstr(y, 4, "例如: 德味 / 复古胶片 / 黑白 / 电影感 / 日系小清新",
+                               curses.color_pair(C_MUTED))
+            y += 2
+
+            # 输入框
+            box_h, box_w = 3, min(60, self.w - 8)
+            box_x = (self.w - box_w) // 2
+            self.stdscr.addstr(y, box_x, "┌" + "─" * (box_w - 2) + "┐")
+            y += 1
+            self.stdscr.addstr(y, box_x, "│" + " " * (box_w - 2) + "│")
+            y += 1
+            self.stdscr.addstr(y, box_x, "└" + "─" * (box_w - 2) + "┘")
+            input_y = y - 2
+            input_x = box_x + 1
+
+            curses.curs_set(1)  # 显示光标
+            self.stdscr.refresh()
+
+            # 使用 curses.textpad 进行输入
+            import curses.textpad
+            edit_win = curses.newwin(1, box_w - 2, input_y, input_x)
+            edit_box = curses.textpad.Textbox(edit_win)
+            edit_win.refresh()
+            query = edit_box.edit().strip()
+
+            curses.curs_set(0)  # 隐藏光标
+
+            if query:
+                # 显示处理中
+                self.stdscr.addstr(y + 2, 2, "查询中...", curses.color_pair(C_MUTED))
+                self.stdscr.refresh()
+
+                # 执行查询
+                api_key, base_url, model = get_api_config()
+                matches = match_query(
+                    self.results, query, api_key, model, base_url)
+
+                # 显示结果
+                self.stdscr.clear()
+                self.draw_header("  💬 查询结果  ")
+
+                result_y = 3
+                if not matches:
+                    self.stdscr.addstr(result_y, 2, "未找到匹配的 LUT",
+                                       curses.color_pair(C_ERROR))
+                else:
+                    medals = ["🥇", "🥈", "🥉"]
+                    for i, m in enumerate(matches[:5]):
+                        medal = medals[i] if i < 3 else f"  {i+1}."
+                        name = m.get("name", "?")
+                        rel = m.get("relevance", 0)
+                        reason = m.get("reason", "")
+                        bar = "█" * int(rel / 10) + "░" * (10 - int(rel / 10))
+                        self.stdscr.addstr(result_y, 2,
+                                           f" {medal} [{name}] {rel:.0f}% {bar}",
+                                           curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD)
+                        result_y += 1
+                        if reason:
+                            for line in [reason[i:i+self.w-8] for i in range(0, len(reason), self.w-8)]:
+                                self.stdscr.addstr(result_y, 6, line,
+                                                   curses.color_pair(C_OK))
+                                result_y += 1
+                        result_y += 1
+
+                self.draw_footer([
+                    ("Q", "再查一次"),
+                    ("ESC", "返回结果"),
+                    ("X", "退出"),
+                ])
+                self.stdscr.refresh()
+
+                while True:
+                    k = self.stdscr.getch()
+                    if k == ord('q') or k == ord('Q'):
+                        self.screen = "query"
+                        return
+                    elif k == 27:  # ESC
+                        self.screen = "results"
+                        return
+                    elif k == ord('x') or k == ord('X'):
+                        self.running = False
+                        return
+            else:
+                self.screen = "results"
+
+        except curses.error:
+            curses.curs_set(0)
+            self.screen = "results"
+
+    def handle_query_key(self, key):
+        """查询屏幕按键处理。"""
+        if key == 27:  # ESC
+            self.screen = "results"
+        elif key == ord('x') or key == ord('X'):
+            self.running = False
+
+    def handle_key(self, key):
+        """主分发。"""
+        if self.screen == "main":
+            self.handle_main_key(key)
+        elif self.screen == "settings":
+            self.handle_settings_key(key)
+        elif self.screen == "processing":
+            self.handle_processing_key(key)
+        elif self.screen == "results":
+            self.handle_results_key(key)
+        elif self.screen == "query":
+            self.handle_query_key(key)
+
+    # ----------------------------------------------------------
+    #  导出
+    # ----------------------------------------------------------
+
+    def export_json(self, custom_path=None):
+        """导出结果为 JSON。若已自动导出且用户选择手动，可自定义路径。"""
+        if not self.results:
+            return
+        out_path = custom_path or self.export_path or \
+                   os.path.join(self.output_dir, "eval_result.json")
+        export_results_json(self.results, self.best_lut,
+                            self.best_reason, out_path)
+        self.export_path = out_path
+
+    # ----------------------------------------------------------
+    #  主循环
+    # ----------------------------------------------------------
+
+    def run(self):
+        """主事件循环。"""
+        self.setup_colors()
+        curses.curs_set(0)   # 隐藏光标
+        self.stdscr.nodelay(0)
+        self.stdscr.keypad(1)
+
+        # 首次扫描
+        self.run_scan()
+
+        while self.running:
+            curses.update_lines_cols()
+            self.w = curses.COLS
+            self.h = curses.LINES
+
+            if self.screen == "main":
+                self.draw_main_screen()
+            elif self.screen == "settings":
+                self.draw_settings_screen()
+            elif self.screen == "processing":
+                self.draw_processing_screen()
+            elif self.screen == "results":
+                self.draw_results_screen()
+            elif self.screen == "query":
+                self.draw_query_screen()
+
+            key = self.stdscr.getch()
+            self.handle_key(key)
+
+        return self.results
+
+
+# ============================================================
+#  CLI 模式
+# ============================================================
+
+def run_cli(args: argparse.Namespace) -> int:
+    """CLI 模式入口。"""
+    if not HAS_ENGINE:
+        print("错误: engine.py 未找到")
+        return 1
+
+    # 配置
+    output_dir = args.output or "./results"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 发现 LUT
+    luts = discover_luts(args.lut_dir or ".")
+    if not luts:
+        print("未发现 .cube 文件")
+        return 1
+    print(f"发现 {len(luts)} 个 LUT")
+
+    # 测试图
+    test_image = args.image or discover_test_image()
+    if not test_image:
+        print("未发现测试图，请用 --image 指定")
+        return 1
+    print(f"测试图: {test_image}")
+
+    # API 配置
+    api_key, base_url, model = get_api_config()
+    if args.api_key:
+        api_key = args.api_key
+    if args.model:
+        model = args.model
+    if args.base_url:
+        base_url = args.base_url
+
+    # 管线
+    results, best_lut, best_reason, images = run_pipeline(
+        lut_tool_path=args.lut_tool or "./lut_tool",
+        test_image_path=test_image,
+        output_dir=output_dir,
+        luts=luts,
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+    )
+
+    # 输出
+    print(format_result_summary(results, best_lut, best_reason))
+
+    if args.json:
+        export_results_json(results, best_lut, best_reason,
+                           os.path.join(output_dir, "eval_result.json"))
+        print(f"\n结果已导出: {output_dir}/eval_result.json")
+
+    # 自然语言查询
+    if args.query:
+        print()
+        print(format_query_result(
+            match_query(results, args.query, api_key, model, base_url),
+            args.query))
+
+    # 交互式查询模式
+    if args.interactive and results:
+        print("\n" + "=" * 60)
+        print("  💬 自然语言风格查询模式")
+        print("  输入风格描述如: 德味 / 复古 / 黑白 / 电影感 / 日系小清新")
+        print("  输入空行或 q 退出")
+        print("=" * 60)
+        while True:
+            try:
+                q = input("\n  ▶ ").strip()
+                if not q or q.lower() == 'q':
+                    break
+                print()
+                print(format_query_result(
+                    match_query(results, q, api_key, model, base_url), q))
+            except (EOFError, KeyboardInterrupt):
+                break
+
+    return 0
+
+
+# ============================================================
+#  主入口
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="LUT 风格评估工具 — 兼容所有 OpenAI API 格式",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""环境变量:
+  OPENAI_API_KEY    API 密钥
+  OPENAI_BASE_URL   API 地址 (默认 https://api.openai.com/v1)
+  OPENAI_MODEL      模型名 (默认 gpt-4o)
+
+示例:
+  python app.py                                     # TUI 模式
+  python app.py --cli -i photo.jpg                  # CLI 评估
+  python app.py --cli -i photo.jpg -q "德味"         # 评估+风格查询
+  python app.py --cli -i photo.jpg -I               # 评估+交互式查询
+  OPENAI_API_KEY=sk-xxx python app.py               # 传 API Key
+""")
+    parser.add_argument("--cli", action="store_true",
+                       help="CLI 模式 (默认 TUI)")
+    parser.add_argument("--image", "-i", default=None,
+                       help="测试图路径")
+    parser.add_argument("--lut-dir", "-d", default=".",
+                       help="LUT 目录")
+    parser.add_argument("--output", "-o", default="./results",
+                       help="输出目录")
+    parser.add_argument("--api-key", "-k", default=None,
+                       help="API Key (默认取 OPENAI_API_KEY)")
+    parser.add_argument("--base-url", default=None,
+                       help="API 地址 (默认取 OPENAI_BASE_URL)")
+    parser.add_argument("--model", "-m", default=None,
+                       help="模型名 (默认取 OPENAI_MODEL)")
+    parser.add_argument("--lut-tool", default="./lut_tool",
+                       help="C 工具路径")
+    parser.add_argument("--json", action="store_true",
+                       help="导出 JSON")
+    parser.add_argument("--query", "-q", default=None,
+                       help="自然语言风格查询，如: '德味 复古' / '黑白电影感'")
+    parser.add_argument("--interactive", "-I", action="store_true",
+                       help="评估后进入交互式风格查询模式")
+    args = parser.parse_args()
+
+    # CLI 模式
+    if args.cli or not sys.stdout.isatty():
+        return run_cli(args)
+
+    # TUI 模式 (curses)
+    try:
+        results = curses.wrapper(lambda stdscr: LutTUI(stdscr).run())
+        return 0
+    except KeyboardInterrupt:
+        return 0
+    except Exception as e:
+        print(f"TUI 错误: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
