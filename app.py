@@ -241,7 +241,11 @@ class LutTUI:
         self.auto_export: bool = True
         self.export_path: str = ""
 
-        # 处理状态
+        # 风格目标（可选，评估前设定）
+        self.style_goal: str = ""
+
+        # 状态标记
+        self.welcomed = False
         self.progress_msg = ""
         self.progress_pct = 0.0
         self.processing_done = False
@@ -440,6 +444,16 @@ class LutTUI:
             pass
         y += 2
 
+        # -- 风格目标（评估前设定）--
+        goal_attr = curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD if self.style_goal else curses.color_pair(C_MUTED)
+        try:
+            self.stdscr.addstr(y, 2, "🎯 目标: ", curses.A_BOLD)
+            goal_display = self.style_goal if self.style_goal else "(按 G 设定风格目标，选图评估后自动匹配)"
+            self.stdscr.addstr(y, 11, trunc(goal_display, self.w - 14), goal_attr)
+        except curses.error:
+            pass
+        y += 1
+
         # -- LUT 筛选输入 --
         try:
             self.stdscr.addstr(y, 2, "🔍 筛选: ", curses.A_BOLD)
@@ -602,6 +616,186 @@ class LutTUI:
         ])
         self.stdscr.refresh()
 
+    def draw_welcome_screen(self):
+        """首次启动欢迎引导。"""
+        self.stdscr.clear()
+        self.draw_header("  👋 欢迎使用 LutScope  ")
+
+        lines = [
+            ("", curses.A_BOLD, curses.color_pair(C_TITLE)),
+            ("  LutScope 帮你找到最适合照片的 LUT 风格", 0, 0),
+            ("", 0, 0),
+            ("  🎯 核心流程（三步）", curses.A_BOLD, curses.color_pair(C_HIGHLIGHT)),
+            ("", 0, 0),
+            ("  ① 设置 API（选做，不设也能用）", 0, 0),
+            ("     主屏按 2 → 按 1/2/3 输入 API Key/URL/模型", 0, 0),
+            ("", 0, 0),
+            ("  ② 设定风格目标（选做）", 0, 0),
+            ("     主屏按 G → 输入'德味''复古''电影感' → 评估后自动匹配合适 LUT", 0, 0),
+            ("", 0, 0),
+            ("  ③ 选图评估", 0, 0),
+            ("     SPACE 选/不选测试图 | A 全选 | N 全不选", 0, 0),
+            ("     按 1 开始评估所有选中的图和 LUT", 0, 0),
+            ("", 0, 0),
+            ("  ③ 查看结果 + 查询风格", 0, 0),
+            ("     结果屏按 S → 输入'德味''复古''电影感' → AI 推荐", 0, 0),
+            ("     多图时按 M → AI 综合所有图片出报告", 0, 0),
+            ("", 0, 0),
+            ("  ⌨️ 常用键位", curses.A_BOLD, curses.color_pair(C_HIGHLIGHT)),
+            ("", 0, 0),
+            ("  1=评估  2=设置  G=风格目标  S=查风格  M=多图整合", 0, 0),
+            ("  SPACE=选图  F=正则筛选  E=导出  H=帮助  Q=退出", 0, 0),
+            ("", 0, 0),
+            ("  无需 API Key 时自动使用本地色彩分析（结果略简单）", 0, 0),
+            ("  建议配置 API 以获得 AI 风格分析体验 ⬆", 0, 0),
+        ]
+
+        y = 2
+        for text, attr, color in lines:
+            try:
+                if attr:
+                    c = color or 0
+                    self.stdscr.addstr(y, 0, text, attr | c)
+                else:
+                    self.stdscr.addstr(y, 0, text)
+            except curses.error:
+                pass
+            y += 1
+            if y >= self.h - 3:
+                break
+
+        self.draw_footer([
+            ("ENTER", "开始使用"),
+            ("H", "完整帮助"),
+            ("Q", "退出"),
+        ])
+        self.stdscr.refresh()
+
+        while True:
+            k = self.stdscr.getch()
+            if k == 10 or k == 13 or k == ord(' '):  # ENTER / SPACE
+                break
+            elif k == ord('h') or k == ord('H'):
+                self.draw_help_screen()
+                break
+            elif k == ord('q') or k == ord('Q'):
+                self.running = False
+                break
+            elif k == 27:  # ESC
+                break
+            elif k == ord('s') or k == ord('S'):
+                # 直接跳到设置
+                self.screen = "settings"
+                break
+
+    def draw_query_with_goal(self):
+        """评估完成后自动按风格目标查询并展示结果。"""
+        api_key = self.api_key or os.environ.get("OPENAI_API_KEY", "")
+        if not api_key or not self.style_goal or not self.results:
+            return
+
+        self.stdscr.clear()
+        self.draw_header(f"  🎯 目标: {self.style_goal}  ")
+
+        y = 3
+        try:
+            self.stdscr.addstr(y, 2, f"评估完成！按预设风格目标匹配最佳 LUT...",
+                               curses.A_BOLD)
+        except curses.error:
+            pass
+        y += 2
+
+        # 流式窗口
+        win_h = min(self.h - y - 4, 8)
+        win_w = self.w - 6
+        win = curses.newwin(max(win_h, 3), win_w, y, 2)
+        win.bkgd(' ', curses.A_NORMAL)
+        win.erase()
+        try:
+            win.box()
+            win.addstr(0, 2, f" 🤖 匹配 \"{self.style_goal}\" ",
+                       curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD)
+        except curses.error:
+            pass
+        win.refresh()
+
+        display_buf = ""
+        def on_chunk(chunk):
+            nonlocal display_buf
+            display_buf += chunk
+            try:
+                win.erase()
+                win.box()
+                win.addstr(0, 2, f" 🤖 匹配 \"{self.style_goal}\" ",
+                           curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD)
+                lines = display_buf.split("\n")
+                for i, line in enumerate(lines[-(win_h - 2):]):
+                    win.addstr(i + 1, 2, line[:win_w - 4])
+                win.refresh()
+            except curses.error:
+                pass
+
+        matches = match_query(
+            self.results, self.style_goal, api_key,
+            self.api_model, self.api_base_url,
+            stream_callback=on_chunk)
+
+        # 显示结果
+        self.stdscr.clear()
+        self.draw_header(f"  🎯 目标: {self.style_goal}  ")
+        ry = 3
+        try:
+            if matches:
+                self.stdscr.addstr(ry, 2, "🏆 最佳匹配:", curses.A_BOLD)
+                ry += 1
+                medals = ["🥇", "🥈", "🥉"]
+                for i, m in enumerate(matches[:5]):
+                    medal = medals[i] if i < 3 else f"  {i+1}."
+                    name = m.get("name", "?")
+                    rel = m.get("relevance", 0)
+                    reason = m.get("reason", "")
+                    bar = "█" * int(rel // 10) + "░" * (10 - int(rel // 10))
+                    try:
+                        self.stdscr.addstr(ry, 4, f"{medal} [{name}] {rel:.0f}% {bar}",
+                                           curses.color_pair(C_MEDAL_1 if i < 3 else curses.A_NORMAL))
+                    except curses.error:
+                        pass
+                    ry += 1
+                    if reason:
+                        for line in [reason[j:j+self.w-10]
+                                     for j in range(0, len(reason), self.w-10)]:
+                            try:
+                                self.stdscr.addstr(ry, 6, line, curses.color_pair(C_OK))
+                            except curses.error:
+                                pass
+                            ry += 1
+                    ry += 1
+        except curses.error:
+            pass
+
+        self.draw_footer([
+            ("ENTER", "查看完整结果"),
+            ("G", "改目标"),
+            ("Q", "退出"),
+        ])
+        self.stdscr.refresh()
+
+        while True:
+            k = self.stdscr.getch()
+            if k == 10 or k == 13 or k == 27:
+                self.screen = "results"
+                return
+            elif k == ord('g') or k == ord('G'):
+                goal = self._edit_field("风格目标", self.style_goal, 50)
+                if goal is not None:
+                    self.style_goal = goal
+                # 重新查询
+                self.draw_query_with_goal()
+                return
+            elif k == ord('q') or k == ord('Q'):
+                self.running = False
+                return
+
     def draw_help_screen(self):
         """帮助指南屏幕 — 所有操作说明。"""
         self.stdscr.clear()
@@ -626,8 +820,8 @@ class LutTUI:
             ("", 0, 0),
             ("  ⌨️ 全部键位", curses.A_BOLD, curses.color_pair(C_HIGHLIGHT)),
             ("", 0, 0),
-            ("  主屏:  1=评估  2=设置  3=导出  F=正则筛选  R=扫描", 0, 0),
-            ("         SPACE=选图  A=全选  N=全不选  H=本帮助  Q=退出", 0, 0),
+            ("  主屏:  1=评估  2=设置  3=导出  G=风格目标  F=正则筛选", 0, 0),
+            ("         SPACE=选图  A=全选  N=全不选  H=本帮助  R=扫描  Q=退出", 0, 0),
             ("", 0, 0),
             ("  结果屏: S=查风格  M=多图整合  E=导出  R=重评  Q=退出", 0, 0),
             ("          1-9=查看LUT详情  ESC=返回主屏", 0, 0),
@@ -1009,6 +1203,14 @@ class LutTUI:
         if not merged:
             self.processing_error = "处理失败: 请检查日志"
 
+        # 风格目标自动查询
+        if merged and self.style_goal:
+            q = self.style_goal
+            api_key = self.api_key or os.environ.get("OPENAI_API_KEY", "")
+            if api_key:
+                # 直接跳转到查询屏
+                self.screen = "results"
+
     # ----------------------------------------------------------
     #  事件循环
     # ----------------------------------------------------------
@@ -1026,6 +1228,11 @@ class LutTUI:
                 if self.processing_done:
                     if self.results:
                         self.screen = "results"
+                        # 风格目标自动查询
+                        if self.style_goal:
+                            api_key = self.api_key or os.environ.get("OPENAI_API_KEY", "")
+                            if api_key:
+                                self.draw_query_with_goal()
                     else:
                         self.screen = "main"
                 else:
@@ -1045,6 +1252,10 @@ class LutTUI:
                 self.lut_filter = new_filter
         elif key == ord('c') or key == ord('C'):
             self.lut_filter = ""
+        elif key == ord('g') or key == ord('G'):
+            goal = self._edit_field("风格目标 (如: 德味 / 复古 / 电影感 / 黑白)", self.style_goal, 50)
+            if goal is not None:
+                self.style_goal = goal
         elif key == ord('h') or key == ord('H'):
             self.draw_help_screen()
         elif key == ord(' '):  # SPACE — 切换当前图像选中
@@ -1476,6 +1687,11 @@ class LutTUI:
 
         # 首次扫描
         self.run_scan()
+
+        # 首次启动显示欢迎引导（仅一次）
+        if not self.welcomed:
+            self.welcomed = True
+            self.draw_welcome_screen()
 
         while self.running:
             curses.update_lines_cols()
