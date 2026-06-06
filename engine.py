@@ -518,6 +518,71 @@ def call_llm_api(
     except Exception:
         return None
 
+
+def stream_llm_api(
+    api_key: str,
+    messages: List[Dict],
+    model: str = DEFAULT_MODEL,
+    base_url: str = DEFAULT_API_URL,
+    max_tokens: int = 4096,
+    temperature: float = 0.3,
+    on_chunk: Optional[Callable[[str], None]] = None,
+) -> Optional[str]:
+    """
+    流式调用 OpenAI 兼容的 Chat API。
+
+    通过 on_chunk 回调实时返回每一段增量内容。
+    最终返回完整文本。
+    """
+    if not HAS_REQUESTS:
+        return None
+
+    url = f"{base_url}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": True,
+    }
+
+    full_text = ""
+    try:
+        resp = requests.post(
+            url, headers=headers, json=payload,
+            stream=True, timeout=120)
+        if resp.status_code != 200:
+            return None
+
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            raw = line.decode("utf-8", errors="replace").strip()
+            if not raw.startswith("data: "):
+                continue
+            data_str = raw[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                obj = json.loads(data_str)
+                delta = obj.get("choices", [{}])[0].get("delta", {})
+                content = delta.get("content", "")
+                if content:
+                    full_text += content
+                    if on_chunk:
+                        on_chunk(content)
+            except (json.JSONDecodeError, KeyError, IndexError):
+                continue
+
+        return full_text
+    except Exception:
+        return None
+
+
 # ============================================================
 #  AI 评估 — 基于色彩统计 (无需视觉)
 # ============================================================
@@ -941,8 +1006,9 @@ def match_query_ai(
     api_key: str,
     model: str = DEFAULT_MODEL,
     base_url: str = DEFAULT_API_URL,
+    stream_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[List[Dict], str]:
-    """用 AI 根据自然语言查询匹配最佳 LUT。"""
+    """用 AI 根据自然语言查询匹配最佳 LUT。支持流式输出。"""
     if not results or not query:
         return [], ""
 
@@ -953,7 +1019,13 @@ def match_query_ai(
         {"role": "user", "content": prompt},
     ]
 
-    response = call_llm_api(api_key, messages, model, base_url)
+    if stream_callback:
+        response = stream_llm_api(
+            api_key, messages, model, base_url,
+            on_chunk=stream_callback)
+    else:
+        response = call_llm_api(api_key, messages, model, base_url)
+
     parsed = parse_eval_json(response)
 
     matches = parsed.get("matches", [])
@@ -1033,17 +1105,20 @@ def match_query(
     api_key: str = "",
     model: str = DEFAULT_MODEL,
     base_url: str = DEFAULT_API_URL,
+    stream_callback: Optional[Callable[[str], None]] = None,
 ) -> List[Dict]:
     """
     自然语言查询匹配入口。
-    有 API 走 AI 匹配，否则走本地关键词匹配。
+    有 API 走 AI 匹配（支持流式），否则走本地关键词匹配。
     返回: [{"name": str, "relevance": float, "reason": str}, ...]
     """
     if not results or not query:
         return []
 
     if api_key and HAS_REQUESTS:
-        matches, _ = match_query_ai(results, query, api_key, model, base_url)
+        matches, _ = match_query_ai(
+            results, query, api_key, model, base_url,
+            stream_callback=stream_callback)
         return matches
     else:
         return match_query_local(results, query)

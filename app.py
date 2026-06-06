@@ -1063,7 +1063,7 @@ class LutTUI:
                 self.show_lut_detail(idx)
 
     def draw_query_screen(self):
-        """自然语言查询界面。"""
+        """自然语言查询界面 — 支持 AI 实时流式输出。"""
         self.stdscr.clear()
         self.draw_header("  💬 风格查询  ")
 
@@ -1086,7 +1086,6 @@ class LutTUI:
                 y += 1
                 self.stdscr.addstr(y, box_x, "└" + "─" * (box_w - 2) + "┘")
             except curses.error:
-                # 窗口太小或编码不支持 unicode 边框
                 try:
                     self.stdscr.addstr(y, box_x, "+" + "-" * (box_w - 2) + "+")
                     y += 1
@@ -1094,40 +1093,78 @@ class LutTUI:
                     y += 1
                     self.stdscr.addstr(y, box_x, "+" + "-" * (box_w - 2) + "+")
                 except curses.error:
-                    y += 2  # 跳过，放弃绘制
+                    y += 2
             input_y = y - 2
             input_x = box_x + 1
 
-            curses.curs_set(1)  # 显示光标
+            curses.curs_set(1)
             self.stdscr.refresh()
 
-            # 使用 curses.textpad 进行输入
             import curses.textpad
             edit_win = curses.newwin(1, box_w - 2, input_y, input_x)
             edit_box = curses.textpad.Textbox(edit_win)
             edit_win.refresh()
             query = edit_box.edit().strip()
 
-            curses.curs_set(0)  # 隐藏光标
+            curses.curs_set(0)
 
             if query:
-                # 显示处理中
-                self.stdscr.addstr(y + 2, 2, "查询中...", curses.color_pair(C_MUTED))
-                self.stdscr.refresh()
-
-                # 执行查询
+                # 创建流式输出窗口
                 api_key, base_url, model = get_api_config()
-                matches = match_query(
-                    self.results, query, api_key, model, base_url)
+                stream_h = self.h - y - 6
+                stream_w = self.w - 6
+                stream_y = y + 2
+                stream_x = 2
+                stream_win = curses.newwin(stream_h, stream_w,
+                                           stream_y, stream_x)
+                stream_win.bkgd(' ', curses.A_NORMAL)
+                stream_win.erase()
+                stream_win.box()
+                stream_win.addstr(0, 2, " 🤖 AI 实时响应 ",
+                                  curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD)
+                stream_win.refresh()
 
-                # 显示结果
+                # 流式缓冲区
+                buf = ""
+                display_buf = ""
+
+                def on_chunk(chunk: str):
+                    nonlocal buf, display_buf
+                    buf += chunk
+                    display_buf += chunk
+                    # 每收到一块就刷新一次窗口
+                    try:
+                        stream_win.erase()
+                        stream_win.box()
+                        stream_win.addstr(0, 2, " 🤖 AI 实时响应 ",
+                                          curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD)
+                        lines = display_buf.split("\n")
+                        max_rows = stream_h - 2
+                        # 只显示最后 max_rows 行
+                        for i, line in enumerate(lines[-max_rows:]):
+                            if i + 1 < stream_h:
+                                stream_win.addstr(i + 1, 2,
+                                                  line[:stream_w - 4])
+                        stream_win.refresh()
+                    except curses.error:
+                        pass
+
+                # 执行流式查询
+                matches = match_query(
+                    self.results, query, api_key, model, base_url,
+                    stream_callback=on_chunk)
+
+                # 查询完成 → 展示最终结果
                 self.stdscr.clear()
                 self.draw_header("  💬 查询结果  ")
 
                 result_y = 3
                 if not matches:
-                    self.stdscr.addstr(result_y, 2, "未找到匹配的 LUT",
-                                       curses.color_pair(C_ERROR))
+                    try:
+                        self.stdscr.addstr(result_y, 2, "未找到匹配的 LUT",
+                                           curses.color_pair(C_ERROR))
+                    except curses.error:
+                        pass
                 else:
                     medals = ["🥇", "🥈", "🥉"]
                     for i, m in enumerate(matches[:5]):
@@ -1136,14 +1173,21 @@ class LutTUI:
                         rel = m.get("relevance", 0)
                         reason = m.get("reason", "")
                         bar = "█" * int(rel / 10) + "░" * (10 - int(rel / 10))
-                        self.stdscr.addstr(result_y, 2,
-                                           f" {medal} [{name}] {rel:.0f}% {bar}",
-                                           curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD)
+                        try:
+                            self.stdscr.addstr(result_y, 2,
+                                               f" {medal} [{name}] {rel:.0f}% {bar}",
+                                               curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD)
+                        except curses.error:
+                            pass
                         result_y += 1
                         if reason:
-                            for line in [reason[i:i+self.w-8] for i in range(0, len(reason), self.w-8)]:
-                                self.stdscr.addstr(result_y, 6, line,
-                                                   curses.color_pair(C_OK))
+                            for line in [reason[i:i+self.w-8]
+                                         for i in range(0, len(reason), self.w-8)]:
+                                try:
+                                    self.stdscr.addstr(result_y, 6, line,
+                                                       curses.color_pair(C_OK))
+                                except curses.error:
+                                    pass
                                 result_y += 1
                         result_y += 1
 
@@ -1159,7 +1203,7 @@ class LutTUI:
                     if k == ord('q') or k == ord('Q'):
                         self.screen = "query"
                         return
-                    elif k == 27:  # ESC
+                    elif k == 27:
                         self.screen = "results"
                         return
                     elif k == ord('x') or k == ord('X'):
@@ -1327,7 +1371,7 @@ def run_cli(args: argparse.Namespace) -> int:
     # 交互式查询（最后一张图的结果）
     if args.interactive and all_merged:
         print("\n" + "=" * 60)
-        print("  💬 自然语言风格查询模式")
+        print("  💬 自然语言风格查询模式 (🔄 实时流式输出)")
         print("  输入空行或 q 退出")
         print("=" * 60)
         while True:
@@ -1336,8 +1380,20 @@ def run_cli(args: argparse.Namespace) -> int:
                 if not q or q.lower() == 'q':
                     break
                 print()
-                print(format_query_result(
-                    match_query(results, q, api_key, model, base_url), q))
+                print("  AI 思考中...", end="", flush=True)
+
+                collected = []
+                def on_chunk(chunk):
+                    collected.append(chunk)
+                    print(chunk, end="", flush=True)
+
+                matches = match_query(
+                    results, q, api_key, model, base_url,
+                    stream_callback=on_chunk)
+
+                print("\n")
+                if matches:
+                    print(format_query_result(matches, q))
             except (EOFError, KeyboardInterrupt):
                 break
 
