@@ -28,6 +28,7 @@ import json
 import time
 import re
 import glob
+import locale
 import curses
 import curses.textpad
 import argparse
@@ -1878,8 +1879,9 @@ def main():
     if args.cli or not sys.stdout.isatty():
         return run_cli(args)
 
-    # TUI 模式 (curses)
+    # TUI 模式 (curses) — 设 locale 支持中文输入
     try:
+        locale.setlocale(locale.LC_ALL, '')
         results = curses.wrapper(lambda stdscr: LutTUI(stdscr).run())
         return 0
     except KeyboardInterrupt:
