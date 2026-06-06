@@ -953,6 +953,196 @@ def export_results_json(results: List[EvalResult],
 
 
 # ============================================================
+#  多结果 AI 整合
+# ============================================================
+
+def build_merge_prompt(
+    per_image_results: Dict[str, List[EvalResult]],
+) -> str:
+    """构建多图整合分析的提示词。"""
+    sections = []
+    for img_name, results in per_image_results.items():
+        items = []
+        for r in results[:5]:
+            tags = ", ".join(r.style_tags)
+            items.append(
+                f"  [{r.name}] 评分:{r.score:.0f}  标签:{tags}\n"
+                f"    描述: {r.description}\n"
+                f"    分析: {r.analysis[:100]}...")
+        sections.append(
+            f"【图片: {img_name}】\n" + "\n".join(items))
+
+    return f"""你是一位专业的影视调色师和 LUT 专家。下面是对同一组 LUT 在多张不同测试图上的评估结果：
+
+{"\n\n".join(sections)}
+
+请综合分析上述数据，按严格 JSON 格式输出（不要包含额外文字）：
+
+```json
+{{
+  "overall_best_lut": "综合最佳 LUT 名称",
+  "overall_best_reason": "为什么这个 LUT 整体表现最好（100-200字）",
+  "per_image_recommendation": {{
+    "图片名": ["推荐 LUT1", "推荐 LUT2"]
+  }},
+  "style_summary": "所有 LUT 的风格总体概括（100-200字）",
+  "cross_image_analysis": "哪些 LUT 在不同图片上表现稳定，哪些有特异性",
+  "rankings": [
+    {{"name": "LUT名称", "score": 综合评分, "reason": "综合理由"}}
+  ]
+}}
+```
+
+要求:
+- rankings 按综合表现从高到低排列，评分 0-100
+- 基于各图数据做客观综合判断，不要臆测"""
+
+
+def merge_results_ai(
+    per_image_results: Dict[str, List[EvalResult]],
+    api_key: str,
+    model: str = DEFAULT_MODEL,
+    base_url: str = DEFAULT_API_URL,
+    stream_callback: Optional[Callable[[str], None]] = None,
+) -> Dict:
+    """用 AI 整合多图评估结果。"""
+    if not per_image_results:
+        return {"rankings": [], "overall_best_lut": ""}
+
+    prompt = build_merge_prompt(per_image_results)
+    messages = [
+        {"role": "system",
+         "content": "你是一名专业的 LUT 调色分析专家。"},
+        {"role": "user", "content": prompt},
+    ]
+
+    if stream_callback:
+        response = stream_llm_api(
+            api_key, messages, model, base_url,
+            on_chunk=stream_callback)
+    else:
+        response = call_llm_api(api_key, messages, model, base_url)
+
+    return parse_eval_json(response)
+
+
+def merge_results_local(
+    per_image_results: Dict[str, List[EvalResult]],
+) -> Dict:
+    """无 API 时本地合并——简单平均评分。"""
+    score_map: Dict[str, List[float]] = {}
+    for img_name, results in per_image_results.items():
+        for r in results:
+            if r.name not in score_map:
+                score_map[r.name] = []
+            score_map[r.name].append(r.score)
+
+    if not score_map:
+        return {"rankings": [], "overall_best_lut": ""}
+
+    avg_scores = [(name, sum(scores) / len(scores))
+                  for name, scores in score_map.items()]
+    avg_scores.sort(key=lambda x: -x[1])
+
+    rankings = []
+    for i, (name, score) in enumerate(avg_scores):
+        rankings.append({
+            "name": name,
+            "score": round(score, 1),
+            "reason": f"综合 {len(score_map[name])} 张图评分: {score:.1f}",
+        })
+
+    return {
+        "overall_best_lut": avg_scores[0][0] if avg_scores else "",
+        "overall_best_reason": f"综合评分最高: {avg_scores[0][1]:.1f}",
+        "rankings": rankings,
+        "style_summary": "本地合并模式 — 基于各图评分的简单平均",
+        "cross_image_analysis": "",
+    }
+
+
+def merge_results(
+    per_image_results: Dict[str, List[EvalResult]],
+    api_key: str = "",
+    model: str = DEFAULT_MODEL,
+    base_url: str = DEFAULT_API_URL,
+    stream_callback: Optional[Callable[[str], None]] = None,
+) -> Dict:
+    """
+    多结果整合入口。
+
+    per_image_results: {"图片名": [EvalResult, ...], ...}
+    返回: {
+        "overall_best_lut": str,
+        "overall_best_reason": str,
+        "rankings": [{"name": str, "score": float, "reason": str}, ...],
+        "style_summary": str,
+        "cross_image_analysis": str,
+        "per_image_recommendation": dict,
+    }
+    """
+    if not per_image_results:
+        return {}
+
+    if api_key and HAS_REQUESTS:
+        return merge_results_ai(
+            per_image_results, api_key, model, base_url, stream_callback)
+    else:
+        return merge_results_local(per_image_results)
+
+
+def format_merge_result(data: Dict) -> str:
+    """格式化整合结果。"""
+    lines = []
+    lines.append("=" * 60)
+    lines.append("  🔗 多图整合分析报告")
+    lines.append("=" * 60)
+
+    best = data.get("overall_best_lut", "")
+    reason = data.get("overall_best_reason", "")
+    if best:
+        lines.append(f"\n  🏆 综合最佳 LUT: {best}")
+        if reason:
+            lines.append(f"     理由: {reason[:200]}")
+
+    # 按图片推荐
+    per_img = data.get("per_image_recommendation", {})
+    if per_img:
+        lines.append(f"\n  📋 按图片推荐:")
+        for img, recs in per_img.items():
+            lines.append(f"    · {img}: {', '.join(recs[:3])}")
+
+    # 风格总结
+    summary = data.get("style_summary", "")
+    if summary and not summary.startswith("本地"):
+        lines.append(f"\n  🎨 风格总结:")
+        lines.append(f"     {summary[:200]}")
+
+    # 交叉分析
+    cross = data.get("cross_image_analysis", "")
+    if cross:
+        lines.append(f"\n  🔄 交叉分析:")
+        lines.append(f"     {cross[:200]}")
+
+    # 综合排名
+    rankings = data.get("rankings", [])
+    if rankings:
+        lines.append(f"\n  📊 综合排名:")
+        medals = ["🥇", "🥈", "🥉"]
+        for i, r in enumerate(rankings[:8]):
+            medal = medals[i] if i < 3 else f"  {i+1}."
+            name = r.get("name", "?")
+            score = r.get("score", 0)
+            reason = r.get("reason", "")
+            lines.append(f"    {medal} [{name}] {score:.0f}/100")
+            if reason and i < 3:
+                lines.append(f"        {reason[:100]}")
+
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+# ============================================================
 #  自然语言查询匹配
 # ============================================================
 

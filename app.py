@@ -34,7 +34,7 @@ import argparse
 import zipfile
 import tempfile
 import shutil
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 # ============================================================
 #  Zipapp / 单文件运行时支持
@@ -151,6 +151,7 @@ try:
         run_pipeline, format_result_summary, export_results_json,
         check_api_key, get_api_config, DEFAULT_MODEL, DEFAULT_API_URL,
         match_query, format_query_result,
+        merge_results, format_merge_result,
     )
     HAS_ENGINE = True
 except ImportError:
@@ -232,6 +233,9 @@ class LutTUI:
 
         # API 配置 (可从环境变量覆盖, TUI 内也可编辑)
         self.api_key, self.api_base_url, self.api_model = get_api_config()
+
+        # 多图结果追踪
+        self.per_image_results: Dict[str, List[EvalResult]] = {}
 
         # 导出设置
         self.auto_export: bool = True
@@ -774,13 +778,17 @@ class LutTUI:
         except curses.error:
             pass
 
-        self.draw_footer([
+        # 整合按钮（多图时显示）
+        merge_btn = "M" if len(self.per_image_results) > 1 else ""
+        items = [
             ("ESC", "返回主屏"),
             ("E", "导出 JSON"),
             ("Q", "查风格"),
-            ("R", "重新评估"),
-            ("X", "退出"),
-        ])
+        ]
+        if merge_btn:
+            items.append(("M", "多图整合"))
+        items += [("R", "重新评估"), ("X", "退出")]
+        self.draw_footer(items)
         self.stdscr.refresh()
 
     # ----------------------------------------------------------
@@ -896,6 +904,7 @@ class LutTUI:
                 progress_cb=progress_cb,
             )
 
+            self.per_image_results[img_name] = results
             all_results.append((img_name, results, best_lut))
             all_images.extend(images)
 
@@ -1042,17 +1051,21 @@ class LutTUI:
 
     def handle_results_key(self, key):
         """结果屏幕按键处理。"""
-        if key == 27:  # ESC
+        if key == 27:
             self.screen = "main"
         elif key == ord('q') or key == ord('Q'):
             self.screen = "query"
         elif key == ord('e') or key == ord('E'):
             self.export_json()
+        elif key == ord('m') or key == ord('M'):
+            if len(self.per_image_results) > 1:
+                self.draw_merge_screen()
         elif key == ord('r') or key == ord('R'):
-            if self.luts and self.test_image:
+            if self.luts and len(self.selected_images):
                 self.processing_done = False
                 self.screen = "processing"
-                self.run_full_pipeline()
+                luts = self._get_filtered_luts()
+                self.run_full_pipeline(luts, list(self.selected_images))
                 if self.processing_done:
                     self.screen = "results" if self.results else "main"
                 else:
@@ -1222,6 +1235,130 @@ class LutTUI:
             self.screen = "results"
         elif key == ord('x') or key == ord('X'):
             self.running = False
+
+    def draw_merge_screen(self):
+        """AI 多图整合分析界面 — 实时流式输出。"""
+        if len(self.per_image_results) < 2:
+            self.screen = "results"
+            return
+
+        self.stdscr.clear()
+        self.draw_header("  🔗 多图整合分析  ")
+        y = 2
+
+        images_info = list(self.per_image_results.items())
+        try:
+            self.stdscr.addstr(y, 2,
+                f"整合 {len(images_info)} 张图 × {len(images_info[0][1])} LUT 的结果...",
+                curses.A_BOLD)
+            y += 1
+            for img_name, results in images_info:
+                best = results[0].name if results else "N/A"
+                try:
+                    self.stdscr.addstr(y, 4, f"{img_name}: {len(results)} LUT "
+                                             f"最佳={best}",
+                                       curses.color_pair(C_MUTED))
+                except curses.error:
+                    pass
+                y += 1
+        except curses.error:
+            pass
+        y += 1
+
+        api_key, base_url, model = get_api_config()
+        win_h = min(self.h - y - 4, 8)
+        win_w = self.w - 6
+        win_y = y
+        win_x = 2
+
+        win = curses.newwin(max(win_h, 3), win_w, win_y, win_x)
+        win.bkgd(' ', curses.A_NORMAL)
+        win.erase()
+        try:
+            win.box()
+            win.addstr(0, 2, " 🤖 AI 整合分析中... ",
+                       curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD)
+        except curses.error:
+            pass
+        win.refresh()
+
+        display_buf = ""
+        def on_chunk(chunk):
+            nonlocal display_buf
+            display_buf += chunk
+            try:
+                win.erase()
+                win.box()
+                win.addstr(0, 2, " 🤖 AI 整合分析中... ",
+                           curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD)
+                lines = display_buf.split("\n")
+                for i, line in enumerate(lines[-(win_h - 2):]):
+                    win.addstr(i + 1, 2, line[:win_w - 4])
+                win.refresh()
+            except curses.error:
+                pass
+
+        result = merge_results(
+            self.per_image_results, api_key, model, base_url,
+            stream_callback=on_chunk)
+
+        # 最终结果
+        self.stdscr.clear()
+        self.draw_header("  🔗 整合分析报告  ")
+        ry = 3
+        try:
+            best = result.get("overall_best_lut", "")
+            reason = result.get("overall_best_reason", "")
+            if best:
+                self.stdscr.addstr(ry, 2, f"🏆 综合最佳: {best}",
+                                   curses.color_pair(C_HIGHLIGHT) | curses.A_BOLD)
+                ry += 1
+                if reason:
+                    for line in [reason[j:j+self.w-8]
+                                 for j in range(0, len(reason), self.w-8)]:
+                        self.stdscr.addstr(ry, 4, line, curses.color_pair(C_OK))
+                        ry += 1
+            ry += 1
+
+            rankings = result.get("rankings", [])
+            if rankings:
+                self.stdscr.addstr(ry, 2, "综合排名:", curses.A_BOLD)
+                ry += 1
+                medals = ["🥇", "🥈", "🥉"]
+                for i, r in enumerate(rankings[:8]):
+                    medal = medals[i] if i < 3 else f"  {i+1}."
+                    name = r.get("name", "?")
+                    score = r.get("score", 0)
+                    self.stdscr.addstr(ry, 4, f"{medal} [{name}] {score:.0f}/100")
+                    ry += 1
+            ry += 1
+
+            summary = result.get("style_summary", "")
+            if summary and not summary.startswith("本地"):
+                self.stdscr.addstr(ry, 2, "风格总结:", curses.A_BOLD)
+                ry += 1
+                for line in [summary[j:j+self.w-8]
+                             for j in range(0, len(summary), self.w-8)]:
+                    self.stdscr.addstr(ry, 4, line, curses.color_pair(C_MUTED))
+                    ry += 1
+        except curses.error:
+            pass
+
+        self.draw_footer([
+            ("E", "导出 JSON"),
+            ("ESC", "返回结果"),
+        ])
+        self.stdscr.refresh()
+
+        while True:
+            k = self.stdscr.getch()
+            if k == 27:
+                self.screen = "results"
+                return
+            elif k == ord('e') or k == ord('E'):
+                out = os.path.join(self.output_dir, "merge_result.json")
+                with open(out, 'w', encoding='utf-8') as f:
+                    json.dump(result, f, ensure_ascii=False, indent=2)
 
     def handle_key(self, key):
         """主分发。"""
