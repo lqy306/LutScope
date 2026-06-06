@@ -952,6 +952,67 @@ def export_results_json(results: List[EvalResult],
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def export_markdown(results: List[EvalResult],
+                    best_lut: str, best_reason: str,
+                    output_path: str):
+    """导出结果为 Markdown 表格。"""
+    lines = []
+    lines.append("# LutScope 评估报告\n")
+    lines.append(f"**最佳 LUT**: `{best_lut}`  ")
+    if best_reason:
+        lines.append(f"**理由**: {best_reason[:200]}  ")
+    lines.append("")
+    lines.append("## LUT 排名\n")
+    lines.append("| 排名 | LUT | 评分 | 风格标签 | 描述 |")
+    lines.append("|------|-----|------|----------|------|")
+
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for r in results:
+        rank_str = medals.get(r.rank, str(r.rank))
+        tags = ", ".join(r.style_tags)
+        desc = r.description.replace("|", "\\|") if r.description else ""
+        lines.append(f"| {rank_str} | `{r.name}` | {r.score:.0f} | {tags} | {desc} |")
+
+    lines.append("")
+    lines.append("---")
+    lines.append("*由 LutScope 自动生成*")
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def convert_images(input_dir: str, output_dir: str = None,
+                   fmt: str = "PNG", delete_original: bool = False) -> List[str]:
+    """
+    批量转换目录中的 PPM 图片为 PNG/JPEG。
+    返回生成的文件路径列表。
+    """
+    if not HAS_PIL:
+        return []
+
+    if output_dir is None:
+        output_dir = input_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    converted = []
+    ext_map = {"PNG": ".png", "JPEG": ".jpg", "JPG": ".jpg", "WEBP": ".webp"}
+    target_ext = ext_map.get(fmt.upper(), ".png")
+
+    for f in sorted(glob.glob(os.path.join(input_dir, "*_watermarked.png"))):
+        try:
+            img = Image.open(f).convert("RGB")
+            base = os.path.splitext(os.path.basename(f))[0]
+            out = os.path.join(output_dir, base + target_ext)
+            img.save(out, fmt.upper())
+            converted.append(out)
+            if delete_original:
+                os.remove(f)
+        except Exception:
+            continue
+
+    return converted
+
+
 # ============================================================
 #  多结果 AI 整合
 # ============================================================

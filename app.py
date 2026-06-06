@@ -32,9 +32,57 @@ import locale
 import curses
 import argparse
 import zipfile
+import logging
 import tempfile
 import shutil
 from typing import Optional, List, Tuple, Dict
+
+# ============================================================
+#  日志与调试
+# ============================================================
+
+DEBUG_MODE = False
+LOG_FILE = None
+
+
+def setup_logging(debug: bool = False, log_path: str = None):
+    """初始化日志系统。"""
+    global DEBUG_MODE, LOG_FILE
+    DEBUG_MODE = debug
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG if debug else logging.INFO)
+    root.handlers.clear()
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S")
+
+    # stderr 只显示 INFO 以上
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setLevel(logging.DEBUG if debug else logging.INFO)
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+
+    # 文件日志记录全部
+    if log_path:
+        try:
+            os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+            fh = logging.FileHandler(log_path, mode='w', encoding='utf-8')
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
+            LOG_FILE = log_path
+        except Exception:
+            pass
+
+
+def log(level: str, msg: str, *args):
+    """快捷日志。"""
+    logger = logging.getLogger()
+    fn = {"debug": logger.debug, "info": logger.info,
+          "warn": logger.warning, "error": logger.error}
+    fn.get(level, logger.info)(msg, *args)
+
 
 # ============================================================
 #  Zipapp / 单文件运行时支持
@@ -152,6 +200,7 @@ try:
         check_api_key, get_api_config, DEFAULT_MODEL, DEFAULT_API_URL,
         match_query, format_query_result,
         merge_results, format_merge_result,
+        export_markdown, convert_images,
     )
     HAS_ENGINE = True
 except ImportError:
@@ -1076,7 +1125,8 @@ class LutTUI:
         items = [
             ("ESC", "返回主屏"),
             ("S", "查风格"),
-            ("E", "导出 JSON"),
+            ("E", "JSON"),
+            ("T", "Markdown"),
         ]
         if merge_btn:
             items.append(("M", "多图整合"))
@@ -1146,6 +1196,7 @@ class LutTUI:
 
     def run_scan(self):
         """扫描 LUT 和测试图（自动搜索常见子目录）。"""
+        log("debug", "Scanning LUTs and images...")
         # LUT: 指定目录 + ./luts/
         lut_dirs = [self.lut_dir]
         if self.lut_dir != "./luts" and os.path.isdir("./luts"):
@@ -1189,6 +1240,8 @@ class LutTUI:
         self.processing_error = ""
         self.processing_done = False
 
+        log("debug", "Pipeline start: %d LUTs, %d images",
+            len(target_luts), len(target_images))
         for img_idx, img_path in enumerate(target_images):
             img_name = os.path.splitext(os.path.basename(img_path))[0]
             img_output = os.path.join(self.output_dir, img_name)
@@ -1246,6 +1299,16 @@ class LutTUI:
 
         if not merged:
             self.processing_error = "处理失败: 请检查日志"
+            log("error", "Pipeline failed: no results (check C binary, LUT paths, image format)")
+
+        log("debug", "Pipeline done: %d merged results, %d images",
+            len(merged), len(all_images))
+
+        # 自动转换水印图为 PNG（已经在 add_watermark 中输出 PNG，但确保一致）
+        for img_name, _, _ in all_results:
+            img_dir = os.path.join(self.output_dir, img_name)
+            if os.path.isdir(img_dir):
+                convert_images(img_dir, img_dir, "PNG")
 
         # 风格目标自动查询
         if merged and self.style_goal:
@@ -1384,6 +1447,8 @@ class LutTUI:
             self.screen = "query"
         elif key == ord('e') or key == ord('E'):
             self.export_json()
+        elif key == ord('t') or key == ord('T'):
+            self.export_markdown()
         elif key == ord('m') or key == ord('M'):
             if len(self.per_image_results) > 1:
                 self.draw_merge_screen()
@@ -1739,7 +1804,7 @@ class LutTUI:
     # ----------------------------------------------------------
 
     def export_json(self, custom_path=None):
-        """导出结果为 JSON。若已自动导出且用户选择手动，可自定义路径。"""
+        """导出结果为 JSON。"""
         if not self.results:
             return
         out_path = custom_path or self.export_path or \
@@ -1747,6 +1812,16 @@ class LutTUI:
         export_results_json(self.results, self.best_lut,
                             self.best_reason, out_path)
         self.export_path = out_path
+
+    def export_markdown(self, custom_path=None):
+        """导出结果为 Markdown 表格。"""
+        if not self.results:
+            return
+        out_path = custom_path or \
+                   os.path.join(self.output_dir, "eval_report.md")
+        export_markdown(self.results, self.best_lut,
+                        self.best_reason, out_path)
+        print(f"  Markdown 已导出: {out_path}")
 
     # ----------------------------------------------------------
     #  主循环
@@ -1857,7 +1932,15 @@ def run_cli(args: argparse.Namespace) -> int:
         if args.json:
             export_results_json(results, best_lut, best_reason,
                                os.path.join(img_output, "eval_result.json"))
-            print(f"  已导出: {img_output}/eval_result.json")
+            print(f"  JSON: {img_output}/eval_result.json")
+        if args.markdown:
+            export_markdown(results, best_lut, best_reason,
+                           os.path.join(img_output, "eval_report.md"))
+            print(f"  Markdown: {img_output}/eval_report.md")
+        if args.convert:
+            fmt = args.convert if isinstance(args.convert, str) else "PNG"
+            converted = convert_images(img_output, img_output, fmt.upper())
+            print(f"  Image convert: {len(converted)} -> {fmt.upper()}")
 
         # 合并
         for r in results:
@@ -1942,11 +2025,25 @@ def main():
                        help="C 工具路径")
     parser.add_argument("--json", action="store_true",
                        help="导出 JSON")
+    parser.add_argument("--markdown", "-m", action="store_true",
+                       help="导出 Markdown 表格报告")
+    parser.add_argument("--convert", "-c", default=None, nargs="?",
+                       const="PNG",
+                       help="转换结果图片格式: PNG/JPEG/WEBP (默认 PNG)")
     parser.add_argument("--query", "-q", default=None,
                        help="自然语言风格查询，如: '德味 复古' / '黑白电影感'")
     parser.add_argument("--interactive", "-I", action="store_true",
                        help="评估后进入交互式风格查询模式")
+    parser.add_argument("--debug", "-D", action="store_true",
+                       help="调试模式: 输出详细日志到 stderr 和 log 文件")
     args = parser.parse_args()
+
+    # 初始化日志
+    log_path = os.path.join(args.output or "./results", "lutscope_debug.log")
+    setup_logging(debug=args.debug, log_path=log_path if args.debug else None)
+    if args.debug:
+        log("info", "🐛 调试模式已启用, 日志: %s", log_path)
+    log("debug", "Args: %s", args)
 
     # CLI 模式
     if args.cli or not sys.stdout.isatty():
