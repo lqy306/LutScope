@@ -413,7 +413,7 @@ class LutTUI:
 
         # 图像操作提示
         try:
-            self.stdscr.addstr(y, 2, "[SPACE]选图 [A]全选 [N]全不选",
+            self.stdscr.addstr(y, 2, "[SPACE]选图 [A]全选 [N]全不选  [H]帮助指南",
                                curses.color_pair(C_HIGHLIGHT))
         except curses.error:
             pass
@@ -528,6 +528,7 @@ class LutTUI:
             ("1", "开始评估"),
             ("2", "⚙️ 设置"),
             ("3", "导出 JSON"),
+            ("H", "帮助"),
             ("R", "扫描"),
             ("Q", "退出"),
         ])
@@ -597,9 +598,78 @@ class LutTUI:
             ("1-6", "编辑字段"),
             ("R", "重置为环境变量"),
             ("ESC", "返回"),
-            ("X", "退出"),
+            ("Q", "退出"),
         ])
         self.stdscr.refresh()
+
+    def draw_help_screen(self):
+        """帮助指南屏幕 — 所有操作说明。"""
+        self.stdscr.clear()
+        self.draw_header("  📖 LutScope 使用指南  ")
+        y = 2
+
+        help_lines = [
+            ("", curses.A_BOLD, curses.color_pair(C_TITLE)),
+            ("  🎯 风格查询（核心功能）", curses.A_BOLD, curses.color_pair(C_HIGHLIGHT)),
+            ("", 0, 0),
+            ("  评估完成后 → 结果屏按 S 键 → 输入风格描述", 0, 0),
+            ("", 0, 0),
+            ("  示例:  德味  /  复古胶片  /  黑白  /  电影感", 0, 0),
+            ("         日系小清新  /  赛博朋克  /  暖调人像", 0, 0),
+            ("         冷调忧郁  /  王家卫风格  /  港风", 0, 0),
+            ("", 0, 0),
+            ("  AI 会逐字输出匹配结果：哪个 LUT 最适合、匹配度、理由", 0, 0),
+            ("", 0, 0),
+            ("  📦 多图整合", curses.A_BOLD, curses.color_pair(C_HIGHLIGHT)),
+            ("", 0, 0),
+            ("  评估多张图后 → 结果屏按 M → AI 综合所有图片给出排名", 0, 0),
+            ("", 0, 0),
+            ("  ⌨️ 全部键位", curses.A_BOLD, curses.color_pair(C_HIGHLIGHT)),
+            ("", 0, 0),
+            ("  主屏:  1=评估  2=设置  3=导出  F=正则筛选  R=扫描", 0, 0),
+            ("         SPACE=选图  A=全选  N=全不选  H=本帮助  Q=退出", 0, 0),
+            ("", 0, 0),
+            ("  结果屏: S=查风格  M=多图整合  E=导出  R=重评  Q=退出", 0, 0),
+            ("          1-9=查看LUT详情  ESC=返回主屏", 0, 0),
+            ("", 0, 0),
+            ("  设置屏: 1-6=编辑字段  R=重置环境变量  ESC=返回", 0, 0),
+            ("", 0, 0),
+            ("  ⚙️ API 配置", curses.A_BOLD, curses.color_pair(C_HIGHLIGHT)),
+            ("", 0, 0),
+            ("  设置屏(主屏按2)可编辑: API Key / Base URL / Model", 0, 0),
+            ("  也可用环境变量:  OPENAI_API_KEY  OPENAI_BASE_URL  OPENAI_MODEL", 0, 0),
+            ("", 0, 0),
+            ("  无 API Key 时自动使用本地色彩统计分析模式", 0, 0),
+            ("", 0, 0),
+        ]
+
+        for text, attr, color in help_lines:
+            if attr:
+                try:
+                    if color:
+                        self.stdscr.addstr(y, 0, text, attr | color)
+                    else:
+                        self.stdscr.addstr(y, 0, text, attr)
+                except curses.error:
+                    pass
+            else:
+                try:
+                    self.stdscr.addstr(y, 0, text)
+                except curses.error:
+                    pass
+            y += 1
+            if y >= self.h - 2:
+                break
+
+        self.draw_footer([
+            ("H", "再看一次"),
+            ("ESC", "返回"),
+            ("Q", "退出"),
+        ])
+        self.stdscr.refresh()
+        # 等待按键
+        self.stdscr.getch()
+        self.screen = "main"
 
     def _edit_field(self, prompt: str, current: str, field_w: int = 50) -> Optional[str]:
         """通用 TUI 文本输入。"""
@@ -975,6 +1045,8 @@ class LutTUI:
                 self.lut_filter = new_filter
         elif key == ord('c') or key == ord('C'):
             self.lut_filter = ""
+        elif key == ord('h') or key == ord('H'):
+            self.draw_help_screen()
         elif key == ord(' '):  # SPACE — 切换当前图像选中
             # 找到主屏幕上的第一个未选中图像来切换
             for i in range(len(self.test_images)):
