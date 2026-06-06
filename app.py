@@ -2025,7 +2025,7 @@ def main():
                        help="C 工具路径")
     parser.add_argument("--json", action="store_true",
                        help="导出 JSON")
-    parser.add_argument("--markdown", "-m", action="store_true",
+    parser.add_argument("--markdown", action="store_true",
                        help="导出 Markdown 表格报告")
     parser.add_argument("--convert", "-c", default=None, nargs="?",
                        const="PNG",
