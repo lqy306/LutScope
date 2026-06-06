@@ -93,7 +93,7 @@ def discover_all_images(dirs: list = None) -> List[str]:
             continue
         for ext in ["*.ppm", "*.png", "*.jpg", "*.jpeg",
                      "*.tif", "*.tiff", "*.bmp", "*.webp"]:
-            for f in sorted(glob.glob(os.path.join(d, ext))):
+            for f in sorted(glob.glob(os.path.join(d, "**", ext), recursive=True)):
                 abspath = os.path.abspath(f)
                 if abspath not in seen:
                     seen.add(abspath)

@@ -140,13 +140,13 @@ def discover_luts(lut_dir: str = ".") -> List[LutEntry]:
             zip_path=zip_path,
         ))
 
-    # 扫描 .cube 文件
-    for f in sorted(glob.glob(os.path.join(lut_dir, "*.cube"))):
+    # 扫描 .cube 文件（递归搜索子目录）
+    for f in sorted(glob.glob(os.path.join(lut_dir, "**", "*.cube"), recursive=True)):
         name = os.path.splitext(os.path.basename(f))[0]
         _add(f, name)
 
-    # 扫描 .zip 内的 .cube
-    for zf in sorted(glob.glob(os.path.join(lut_dir, "*.zip"))):
+    # 扫描 .zip 内的 .cube（递归搜索子目录）
+    for zf in sorted(glob.glob(os.path.join(lut_dir, "**", "*.zip"), recursive=True)):
         try:
             with zipfile.ZipFile(zf, 'r') as z:
                 for info in z.infolist():
