@@ -782,12 +782,12 @@ class LutTUI:
         merge_btn = "M" if len(self.per_image_results) > 1 else ""
         items = [
             ("ESC", "返回主屏"),
+            ("S", "查风格"),
             ("E", "导出 JSON"),
-            ("Q", "查风格"),
         ]
         if merge_btn:
             items.append(("M", "多图整合"))
-        items += [("R", "重新评估"), ("X", "退出")]
+        items += [("R", "重新评估"), ("Q", "退出")]
         self.draw_footer(items)
         self.stdscr.refresh()
 
@@ -1053,7 +1053,7 @@ class LutTUI:
         """结果屏幕按键处理。"""
         if key == 27:
             self.screen = "main"
-        elif key == ord('q') or key == ord('Q'):
+        elif key == ord('s') or key == ord('S'):
             self.screen = "query"
         elif key == ord('e') or key == ord('E'):
             self.export_json()
@@ -1205,21 +1205,21 @@ class LutTUI:
                         result_y += 1
 
                 self.draw_footer([
-                    ("Q", "再查一次"),
+                    ("R", "再查一次"),
                     ("ESC", "返回结果"),
-                    ("X", "退出"),
+                    ("Q", "退出"),
                 ])
                 self.stdscr.refresh()
 
                 while True:
                     k = self.stdscr.getch()
-                    if k == ord('q') or k == ord('Q'):
+                    if k == ord('r') or k == ord('R'):
                         self.screen = "query"
                         return
                     elif k == 27:
                         self.screen = "results"
                         return
-                    elif k == ord('x') or k == ord('X'):
+                    elif k == ord('q') or k == ord('Q'):
                         self.running = False
                         return
             else:
