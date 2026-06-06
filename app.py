@@ -30,7 +30,6 @@ import re
 import glob
 import locale
 import curses
-import curses.textpad
 import argparse
 import zipfile
 import tempfile
@@ -867,49 +866,78 @@ class LutTUI:
         self.screen = "main"
 
     def _edit_field(self, prompt: str, current: str, field_w: int = 50) -> Optional[str]:
-        """通用 TUI 文本输入。"""
-        # 输入框居中
+        """通用 TUI 文本输入 — 支持中文 IME (用 get_wch)。"""
         box_w = min(field_w, self.w - 8)
-        box_h = 3
         y0 = self.h // 2 - 2
         x0 = (self.w - box_w) // 2
 
-        win = curses.newwin(box_h, box_w, y0, x0)
-        win.bkgd(' ', curses.A_NORMAL)
-        win.erase()
-
-        # 边框（加异常保护）
+        # 边框窗
+        win_box = curses.newwin(3, box_w, y0, x0)
+        win_box.bkgd(' ', curses.A_NORMAL)
+        win_box.erase()
         try:
-            win.addch(0, 0, curses.ACS_ULCORNER)
-            win.hline(0, 1, curses.ACS_HLINE, box_w - 2)
-            win.addch(0, box_w - 1, curses.ACS_URCORNER)
-            win.addch(2, 0, curses.ACS_LLCORNER)
-            win.hline(2, 1, curses.ACS_HLINE, box_w - 2)
-            win.addch(2, box_w - 1, curses.ACS_LRCORNER)
+            win_box.addch(0, 0, curses.ACS_ULCORNER)
+            win_box.hline(0, 1, curses.ACS_HLINE, box_w - 2)
+            win_box.addch(0, box_w - 1, curses.ACS_URCORNER)
+            win_box.addch(2, 0, curses.ACS_LLCORNER)
+            win_box.hline(2, 1, curses.ACS_HLINE, box_w - 2)
+            win_box.addch(2, box_w - 1, curses.ACS_LRCORNER)
         except curses.error:
             pass
-
-        if len(prompt) > box_w - 2:
-            prompt_display = prompt[:box_w - 5] + "..."
-        else:
-            prompt_display = prompt
-        win.addstr(0, 2, f" {prompt_display} ", curses.color_pair(C_HIGHLIGHT))
-        win.refresh()
+        pd = prompt[:box_w - 5] + "..." if len(prompt) > box_w - 2 else prompt
+        try:
+            win_box.addstr(0, 2, f" {pd} ", curses.color_pair(C_HIGHLIGHT))
+        except curses.error:
+            pass
+        win_box.refresh()
 
         curses.curs_set(1)
+        self.stdscr.keypad(1)
 
-        # 输入
-        edit_win = curses.newwin(1, box_w - 2, y0 + 1, x0 + 1)
-        if current:
-            edit_win.addstr(0, 0, current)
-        edit_box = curses.textpad.Textbox(edit_win)
-        edit_win.refresh()
-        result = edit_box.edit().strip()
+        # 输入行
+        buf = list(current or "")
+        while True:
+            # 刷新显示
+            edit_win = curses.newwin(1, box_w - 2, y0 + 1, x0 + 1)
+            display = "".join(buf)
+            if len(display) > box_w - 2:
+                display = display[-(box_w - 2):]
+            edit_win.addstr(0, 0, display)
+            edit_win.refresh()
+            del edit_win
+
+            try:
+                ch = self.stdscr.get_wch()
+            except Exception:
+                ch = self.stdscr.getch()
+
+            if isinstance(ch, str):
+                # 普通字符（含中文等多字节字符）
+                if ch == '\n' or ch == '\r':
+                    break
+                if ch == '\b' or ord(ch) == 127:
+                    if buf:
+                        buf.pop()
+                elif ord(ch) >= 32:  # 可打印字符
+                    buf.append(ch)
+            else:
+                # 特殊键
+                if ch == 10 or ch == 13 or ch == ord('\n'):  # ENTER
+                    break
+                elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                    if buf:
+                        buf.pop()
+                elif ch == 27:  # ESC — 取消
+                    buf = []
+                    break
+                elif ch == curses.KEY_ENTER:
+                    break
 
         curses.curs_set(0)
         self.stdscr.touchwin()
         self.stdscr.refresh()
 
+        result = "".join(buf).strip()
         return result if result else None
 
     # ----------------------------------------------------------
@@ -1395,14 +1423,44 @@ class LutTUI:
             input_x = box_x + 1
 
             curses.curs_set(1)
-            self.stdscr.refresh()
+            self.stdscr.keypad(1)
 
-            import curses.textpad
+            # 用 get_wch 输入（支持中文 IME）
+            buf = list("")
             edit_win = curses.newwin(1, box_w - 2, input_y, input_x)
-            edit_box = curses.textpad.Textbox(edit_win)
-            edit_win.refresh()
-            query = edit_box.edit().strip()
+            while True:
+                display = "".join(buf)
+                if len(display) > box_w - 2:
+                    display = display[-(box_w - 2):]
+                edit_win.erase()
+                edit_win.addstr(0, 0, display)
+                edit_win.refresh()
 
+                try:
+                    ch = self.stdscr.get_wch()
+                except Exception:
+                    ch = self.stdscr.getch()
+
+                if isinstance(ch, str):
+                    if ch == '\n' or ch == '\r':
+                        break
+                    if ch == '\b' or ord(ch) == 127:
+                        if buf:
+                            buf.pop()
+                    elif ord(ch) >= 32:
+                        buf.append(ch)
+                else:
+                    if ch in (10, 13, curses.KEY_ENTER):
+                        break
+                    elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                        if buf:
+                            buf.pop()
+                    elif ch == 27:
+                        buf = []
+                        break
+
+            del edit_win
+            query = "".join(buf).strip()
             curses.curs_set(0)
 
             if query:
