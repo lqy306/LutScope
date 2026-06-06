@@ -189,18 +189,21 @@ def trunc(text: str, max_w: int) -> str:
     return text[:max_w - 3] + "..."
 
 def draw_box(win, y: int, x: int, h: int, w: int, title: str = ""):
-    """绘制带边框的盒子。"""
-    win.addch(y, x, curses.ACS_ULCORNER)
-    win.hline(y, x + 1, curses.ACS_HLINE, w - 2)
-    win.addch(y, x + w - 1, curses.ACS_URCORNER)
-    for row in range(y + 1, y + h - 1):
-        win.addch(row, x, curses.ACS_VLINE)
-        win.addch(row, x + w - 1, curses.ACS_VLINE)
-    win.addch(y + h - 1, x, curses.ACS_LLCORNER)
-    win.hline(y + h - 1, x + 1, curses.ACS_HLINE, w - 2)
-    win.addch(y + h - 1, x + w - 1, curses.ACS_LRCORNER)
-    if title:
-        win.addstr(y, x + 2, f" {title} ")
+    """绘制带边框的盒子（全部 addch 加异常保护）。"""
+    try:
+        win.addch(y, x, curses.ACS_ULCORNER)
+        win.hline(y, x + 1, curses.ACS_HLINE, w - 2)
+        win.addch(y, x + w - 1, curses.ACS_URCORNER)
+        for row in range(y + 1, y + h - 1):
+            win.addch(row, x, curses.ACS_VLINE)
+            win.addch(row, x + w - 1, curses.ACS_VLINE)
+        win.addch(y + h - 1, x, curses.ACS_LLCORNER)
+        win.hline(y + h - 1, x + 1, curses.ACS_HLINE, w - 2)
+        win.addch(y + h - 1, x + w - 1, curses.ACS_LRCORNER)
+        if title:
+            win.addstr(y, x + 2, f" {title} ")
+    except curses.error:
+        pass
 
 
 # ============================================================
@@ -606,13 +609,16 @@ class LutTUI:
         win.bkgd(' ', curses.A_NORMAL)
         win.erase()
 
-        # 边框
-        win.addch(0, 0, curses.ACS_ULCORNER)
-        win.hline(0, 1, curses.ACS_HLINE, box_w - 2)
-        win.addch(0, box_w - 1, curses.ACS_URCORNER)
-        win.addch(2, 0, curses.ACS_LLCORNER)
-        win.hline(2, 1, curses.ACS_HLINE, box_w - 2)
-        win.addch(2, box_w - 1, curses.ACS_LRCORNER)
+        # 边框（加异常保护）
+        try:
+            win.addch(0, 0, curses.ACS_ULCORNER)
+            win.hline(0, 1, curses.ACS_HLINE, box_w - 2)
+            win.addch(0, box_w - 1, curses.ACS_URCORNER)
+            win.addch(2, 0, curses.ACS_LLCORNER)
+            win.hline(2, 1, curses.ACS_HLINE, box_w - 2)
+            win.addch(2, box_w - 1, curses.ACS_LRCORNER)
+        except curses.error:
+            pass
 
         if len(prompt) > box_w - 2:
             prompt_display = prompt[:box_w - 5] + "..."
@@ -1073,11 +1079,22 @@ class LutTUI:
             # 输入框
             box_h, box_w = 3, min(60, self.w - 8)
             box_x = (self.w - box_w) // 2
-            self.stdscr.addstr(y, box_x, "┌" + "─" * (box_w - 2) + "┐")
-            y += 1
-            self.stdscr.addstr(y, box_x, "│" + " " * (box_w - 2) + "│")
-            y += 1
-            self.stdscr.addstr(y, box_x, "└" + "─" * (box_w - 2) + "┘")
+            try:
+                self.stdscr.addstr(y, box_x, "┌" + "─" * (box_w - 2) + "┐")
+                y += 1
+                self.stdscr.addstr(y, box_x, "│" + " " * (box_w - 2) + "│")
+                y += 1
+                self.stdscr.addstr(y, box_x, "└" + "─" * (box_w - 2) + "┘")
+            except curses.error:
+                # 窗口太小或编码不支持 unicode 边框
+                try:
+                    self.stdscr.addstr(y, box_x, "+" + "-" * (box_w - 2) + "+")
+                    y += 1
+                    self.stdscr.addstr(y, box_x, "|" + " " * (box_w - 2) + "|")
+                    y += 1
+                    self.stdscr.addstr(y, box_x, "+" + "-" * (box_w - 2) + "+")
+                except curses.error:
+                    y += 2  # 跳过，放弃绘制
             input_y = y - 2
             input_x = box_x + 1
 
