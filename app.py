@@ -1194,8 +1194,10 @@ class LutTUI:
             curses.curs_set(0)
 
             if query:
-                # 创建流式输出窗口
-                api_key, base_url, model = get_api_config()
+                # 创建流式输出窗口（优先用 TUI 内配置）
+                api_key = self.api_key or os.environ.get("OPENAI_API_KEY", "")
+                base_url = self.api_base_url
+                model = self.api_model
                 stream_h = self.h - y - 6
                 stream_w = self.w - 6
                 stream_y = y + 2
@@ -1337,7 +1339,9 @@ class LutTUI:
             pass
         y += 1
 
-        api_key, base_url, model = get_api_config()
+        api_key = self.api_key or os.environ.get("OPENAI_API_KEY", "")
+        base_url = self.api_base_url
+        model = self.api_model
         win_h = min(self.h - y - 4, 8)
         win_w = self.w - 6
         win_y = y
