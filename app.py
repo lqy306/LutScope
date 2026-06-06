@@ -11,9 +11,11 @@ LutScope — 3D LUT 风格评估与自然语言查询工具
 
 用法:
     python app.py                                # 启动 TUI
-    python app.py --cli --image photo.jpg        # CLI 评估
-    python app.py --cli --query "德味 复古"       # 评估+风格查询
-    python app.py --cli --interactive             # 交互式查询
+    python app.py --cli -i photo.jpg             # 单图评估
+    python app.py --cli -i photo1.jpg -i photo2.jpg  # 多图评估
+    python app.py --cli -i test_images/          # 目录扫描
+    python app.py --cli -q "德味"                 # 评估+风格查询
+    python app.py --cli -I                        # 交互式查询
 
 依赖 (运行时可缺失, 部分功能降级):
     Pillow        — 图像处理 (pip install Pillow)
@@ -41,6 +43,61 @@ _LUT_BINARY_CACHE = None
 
 
 def find_lut_tool() -> str:
+    """查找 lut_tool 二进制: 源码 / zipapp / PATH。"""
+    global _LUT_BINARY_CACHE
+    if _LUT_BINARY_CACHE and os.path.exists(_LUT_BINARY_CACHE):
+        return _LUT_BINARY_CACHE
+
+    # 当前目录
+    if os.path.exists("./lut_tool"):
+        _LUT_BINARY_CACHE = os.path.abspath("./lut_tool")
+        return _LUT_BINARY_CACHE
+
+    # 脚本同级目录
+    d = os.path.dirname(os.path.abspath(__file__))
+    c = os.path.join(d, "lut_tool")
+    if os.path.exists(c):
+        _LUT_BINARY_CACHE = c
+        return _LUT_BINARY_CACHE
+
+    # zipapp 内提取
+    if (not __file__.endswith(".py") or
+            (os.path.isfile(sys.argv[0]) and ".pyz" in sys.argv[0])):
+        try:
+            td = os.path.join(tempfile.gettempdir(), "LutScope")
+            os.makedirs(td, exist_ok=True)
+            lp = os.path.join(td, "lut_tool")
+            if not os.path.exists(lp):
+                with zipfile.ZipFile(sys.argv[0]) as z:
+                    z.extract("lut_tool", td)
+                os.chmod(lp, 0o755)
+            _LUT_BINARY_CACHE = lp
+            return lp
+        except Exception:
+            pass
+
+    return "./lut_tool"
+
+
+def discover_all_images(dirs: list = None) -> List[str]:
+    """扫描一个或多个目录中的图片文件。"""
+    if dirs is None:
+        dirs = ["."]
+    images = []
+    seen = set()
+    for d in dirs:
+        if not os.path.isdir(d):
+            if os.path.isfile(d):
+                images.append(os.path.abspath(d))
+            continue
+        for ext in ["*.ppm", "*.png", "*.jpg", "*.jpeg",
+                     "*.tif", "*.tiff", "*.bmp", "*.webp"]:
+            for f in sorted(glob.glob(os.path.join(d, ext))):
+                abspath = os.path.abspath(f)
+                if abspath not in seen:
+                    seen.add(abspath)
+                    images.append(abspath)
+    return images
     """查找 lut_tool 二进制: 源码 / zipapp / PATH。"""
     global _LUT_BINARY_CACHE
     if _LUT_BINARY_CACHE and os.path.exists(_LUT_BINARY_CACHE):
@@ -159,7 +216,8 @@ class LutTUI:
         # 数据
         self.luts: List[LutEntry] = []
         self.lut_filter: str = ""         # LUT 正则过滤器
-        self.test_image: Optional[str] = None
+        self.test_images: List[str] = []  # 所有发现的测试图
+        self.selected_images: set = set() # 选中的下标
         self.output_dir = "./results"
         self.lut_dir = "."
         self.lut_tool_path = find_lut_tool()
@@ -311,12 +369,44 @@ class LutTUI:
         PADDING = 1
         y = HEADER_H + PADDING
 
-        # -- 测试图信息 --
-        img_text = self.test_image or "未发现 (将扫描)"
-        pair = curses.color_pair(C_OK) if self.test_image else curses.A_NORMAL
+        # -- 测试图列表 --
         try:
-            self.stdscr.addstr(y, 2, "📁 测试图:", curses.A_BOLD)
-            self.stdscr.addstr(y, 14, trunc(img_text, self.w - 16), pair)
+            count = len(self.selected_images)
+            total = len(self.test_images)
+            self.stdscr.addstr(y, 2,
+                f"📁 测试图 ({count}/{total} 选中):", curses.A_BOLD)
+        except curses.error:
+            pass
+        y += 1
+        max_img_show = min(len(self.test_images), self.h - y - 20)
+        for i in range(max_img_show):
+            img = self.test_images[i]
+            name = os.path.basename(img)
+            checked = "☑" if i in self.selected_images else "☐"
+            pair = curses.color_pair(C_OK) if i in self.selected_images else curses.A_NORMAL
+            try:
+                self.stdscr.addstr(y, 4, f" {checked}", pair)
+                self.stdscr.addstr(y, 7, trunc(name, max(15, self.w - 30)), pair)
+                # 显示所属目录
+                parent = os.path.basename(os.path.dirname(img))
+                if parent:
+                    self.stdscr.addstr(y, self.w - 30, parent, curses.color_pair(C_MUTED))
+            except curses.error:
+                pass
+            y += 1
+        if len(self.test_images) > max_img_show:
+            try:
+                self.stdscr.addstr(y, 4, f"... 还有 {len(self.test_images) - max_img_show} 个",
+                                   curses.color_pair(C_MUTED))
+            except curses.error:
+                pass
+            y += 1
+        y += 1
+
+        # 图像操作提示
+        try:
+            self.stdscr.addstr(y, 2, "[SPACE]选图 [A]全选 [N]全不选",
+                               curses.color_pair(C_HIGHLIGHT))
         except curses.error:
             pass
         y += 1
@@ -749,59 +839,88 @@ class LutTUI:
     def run_scan(self):
         """扫描 LUT 和测试图。"""
         self.luts = discover_luts(self.lut_dir)
-        self.test_image = discover_test_image()
+        self.test_images = discover_all_images([self.lut_dir, "."])
+        # 默认全选
+        self.selected_images = set(range(len(self.test_images)))
 
-    def run_full_pipeline(self, luts_to_process=None):
-        """完整处理管线。"""
+    def run_full_pipeline(self, luts_to_process=None, image_indices=None):
+        """完整处理管线 — 支持多图。"""
         target_luts = luts_to_process if luts_to_process else self.luts
-        if not target_luts or not self.test_image:
+        target_images = [self.test_images[i] for i in (image_indices or [])]
+
+        if not target_luts or not target_images:
             self.processing_error = "LUT 或测试图未就绪"
             self.screen = "processing"
             return
 
-        os.makedirs(self.output_dir, exist_ok=True)
+        api_key = self.api_key or os.environ.get("OPENAI_API_KEY", "")
+        total_images = len(target_images)
+        total_luts = len(target_luts)
+        all_results = []
+        all_best_lut = ""
+        all_best_reason = ""
+        all_images = []
 
-        def progress_cb(msg: str, pct: float):
-            self.progress_msg = msg
-            self.progress_pct = pct
-            self.draw_processing_screen()
-
-        self.progress_msg = "处理中..."
+        self.progress_msg = "准备中..."
         self.progress_pct = 0.0
         self.processing_error = ""
         self.processing_done = False
 
-        # 获取 API 配置 (TUI 内设置优先于环境变量)
-        api_key = self.api_key or os.environ.get("OPENAI_API_KEY", "")
+        for img_idx, img_path in enumerate(target_images):
+            img_name = os.path.splitext(os.path.basename(img_path))[0]
+            img_output = os.path.join(self.output_dir, img_name)
+            os.makedirs(img_output, exist_ok=True)
 
-        results, best_lut, best_reason, images = run_pipeline(
-            lut_tool_path=self.lut_tool_path,
-            test_image_path=self.test_image,
-            output_dir=self.output_dir,
-            luts=target_luts,
-            api_key=api_key,
-            model=self.api_model,
-            base_url=self.api_base_url,
-            progress_cb=progress_cb,
-        )
+            def progress_cb(msg: str, pct: float):
+                # 将多图进度映射到整体进度
+                base = (img_idx / total_images) * 100.0
+                self.progress_msg = f"[{img_idx+1}/{total_images}] {img_name}: {msg}"
+                self.progress_pct = base + (pct / total_images)
+                self.draw_processing_screen()
 
-        self.results = results
-        self.best_lut = best_lut
-        self.best_reason = best_reason
-        self.watermarked_images = images
+            results, best_lut, best_reason, images = run_pipeline(
+                lut_tool_path=self.lut_tool_path,
+                test_image_path=img_path,
+                output_dir=img_output,
+                luts=target_luts,
+                api_key=api_key,
+                model=self.api_model,
+                base_url=self.api_base_url,
+                progress_cb=progress_cb,
+            )
+
+            all_results.append((img_name, results, best_lut))
+            all_images.extend(images)
+
+            # 自动导出单图结果
+            if self.auto_export and results:
+                export_results_json(
+                    results, best_lut, best_reason,
+                    os.path.join(img_output, "eval_result.json"))
+
+            # 取最好的作为整体代表
+            if results and (not all_best_lut or results[0].score > all_results[0][1][0].score):
+                all_best_lut = best_lut
+                all_best_reason = best_reason
+
+        # 合并所有结果 (展平)
+        merged = []
+        for img_name, results, _ in all_results:
+            for r in results:
+                r.name = f"{r.name} ({img_name})"
+                merged.append(r)
+        merged.sort(key=lambda r: r.score, reverse=True)
+        for i, r in enumerate(merged):
+            r.rank = i + 1
+
+        self.results = merged
+        self.best_lut = all_best_lut
+        self.best_reason = all_best_reason
+        self.watermarked_images = all_images
         self.processing_done = True
         self.processing_error = ""
 
-        # 自动导出
-        if self.auto_export and results:
-            out_path = os.path.join(self.output_dir, "eval_result.json")
-            try:
-                export_results_json(results, best_lut, best_reason, out_path)
-                self.export_path = out_path
-            except Exception:
-                pass
-
-        if not results:
+        if not merged:
             self.processing_error = "处理失败: 请检查日志"
 
     # ----------------------------------------------------------
@@ -813,11 +932,11 @@ class LutTUI:
         if key == ord('q') or key == ord('Q'):
             self.running = False
         elif key == ord('1'):
-            # 使用已筛选的 LUT
             luts_to_process = self._get_filtered_luts()
-            if luts_to_process and self.test_image:
+            selected = list(self.selected_images)
+            if luts_to_process and selected:
                 self.screen = "processing"
-                self.run_full_pipeline(luts_to_process)
+                self.run_full_pipeline(luts_to_process, selected)
                 if self.processing_done:
                     if self.results:
                         self.screen = "results"
@@ -826,7 +945,7 @@ class LutTUI:
                 else:
                     self.screen = "main"
             else:
-                if not self.test_image:
+                if not selected:
                     self.run_scan()
         elif key == ord('2'):
             self.screen = "settings"
@@ -835,12 +954,24 @@ class LutTUI:
         elif key == ord('r') or key == ord('R'):
             self.run_scan()
         elif key == ord('f') or key == ord('F'):
-            # 输入筛选正则
             new_filter = self._edit_field("正则筛选 (如: sepia|blue|mono)", self.lut_filter, 50)
             if new_filter is not None:
                 self.lut_filter = new_filter
         elif key == ord('c') or key == ord('C'):
             self.lut_filter = ""
+        elif key == ord(' '):  # SPACE — 切换当前图像选中
+            # 找到主屏幕上的第一个未选中图像来切换
+            for i in range(len(self.test_images)):
+                if i in self.selected_images and len(self.selected_images) > 1:
+                    self.selected_images.discard(i)
+                    break
+                elif i not in self.selected_images:
+                    self.selected_images.add(i)
+                    break
+        elif key == ord('a') or key == ord('A'):
+            self.selected_images = set(range(len(self.test_images)))
+        elif key == ord('n') or key == ord('N'):
+            self.selected_images = set()
 
     def _get_filtered_luts(self) -> List:
         """返回当前筛选后的 LUT 列表。"""
@@ -1098,30 +1229,39 @@ class LutTUI:
 # ============================================================
 
 def run_cli(args: argparse.Namespace) -> int:
-    """CLI 模式入口。"""
+    """CLI 模式入口 — 支持多图。"""
     if not HAS_ENGINE:
         print("错误: engine.py 未找到")
         return 1
 
-    # 配置
     output_dir = args.output or "./results"
     os.makedirs(output_dir, exist_ok=True)
 
-    # 发现 LUT
+    # LUT
     luts = discover_luts(args.lut_dir or ".")
     if not luts:
         print("未发现 .cube 文件")
         return 1
     print(f"发现 {len(luts)} 个 LUT")
 
-    # 测试图
-    test_image = args.image or discover_test_image()
-    if not test_image:
+    # 测试图 — 多图支持
+    test_images = []
+    if args.image:
+        for img in args.image:
+            if os.path.isdir(img):
+                test_images.extend(discover_all_images([img]))
+            else:
+                test_images.append(os.path.abspath(img))
+    if not test_images:
+        test_images = discover_all_images(["."])
+    if not test_images:
         print("未发现测试图，请用 --image 指定")
         return 1
-    print(f"测试图: {test_image}")
+    print(f"测试图: {len(test_images)} 张")
+    for img in test_images:
+        print(f"  · {os.path.basename(img)}")
 
-    # API 配置
+    # API
     api_key, base_url, model = get_api_config()
     if args.api_key:
         api_key = args.api_key
@@ -1130,37 +1270,46 @@ def run_cli(args: argparse.Namespace) -> int:
     if args.base_url:
         base_url = args.base_url
 
-    # 管线
-    results, best_lut, best_reason, images = run_pipeline(
-        lut_tool_path=args.lut_tool or "./lut_tool",
-        test_image_path=test_image,
-        output_dir=output_dir,
-        luts=luts,
-        api_key=api_key,
-        model=model,
-        base_url=base_url,
-    )
+    # 逐图处理
+    all_merged = []
+    for img_idx, img_path in enumerate(test_images):
+        img_name = os.path.splitext(os.path.basename(img_path))[0]
+        img_output = os.path.join(output_dir, img_name)
+        os.makedirs(img_output, exist_ok=True)
+        print(f"\n--- [{img_idx+1}/{len(test_images)}] {img_name} ---")
 
-    # 输出
-    print(format_result_summary(results, best_lut, best_reason))
+        results, best_lut, best_reason, images = run_pipeline(
+            lut_tool_path=args.lut_tool or "./lut_tool",
+            test_image_path=img_path,
+            output_dir=img_output,
+            luts=luts,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+        )
 
-    if args.json:
-        export_results_json(results, best_lut, best_reason,
-                           os.path.join(output_dir, "eval_result.json"))
-        print(f"\n结果已导出: {output_dir}/eval_result.json")
+        print(format_result_summary(results, best_lut, best_reason))
+        if args.json:
+            export_results_json(results, best_lut, best_reason,
+                               os.path.join(img_output, "eval_result.json"))
+            print(f"  已导出: {img_output}/eval_result.json")
 
-    # 自然语言查询
-    if args.query:
-        print()
-        print(format_query_result(
-            match_query(results, args.query, api_key, model, base_url),
-            args.query))
+        # 合并
+        for r in results:
+            r.name = f"{r.name} ({img_name})"
+            all_merged.append(r)
 
-    # 交互式查询模式
-    if args.interactive and results:
+        # 对每一张图分别支持查询
+        if (args.query or args.interactive) and results:
+            q = args.query
+            if q:
+                print(format_query_result(
+                    match_query(results, q, api_key, model, base_url), q))
+
+    # 交互式查询（最后一张图的结果）
+    if args.interactive and all_merged:
         print("\n" + "=" * 60)
         print("  💬 自然语言风格查询模式")
-        print("  输入风格描述如: 德味 / 复古 / 黑白 / 电影感 / 日系小清新")
         print("  输入空行或 q 退出")
         print("=" * 60)
         while True:
@@ -1191,16 +1340,17 @@ def main():
   OPENAI_MODEL      模型名 (默认 gpt-4o)
 
 示例:
-  python app.py                                     # TUI 模式
-  python app.py --cli -i photo.jpg                  # CLI 评估
-  python app.py --cli -i photo.jpg -q "德味"         # 评估+风格查询
-  python app.py --cli -i photo.jpg -I               # 评估+交互式查询
-  OPENAI_API_KEY=sk-xxx python app.py               # 传 API Key
+  python app.py                                           # TUI 模式
+  python app.py --cli -i photo.jpg                        # 单图评估
+  python app.py --cli -i a.jpg -i b.jpg                   # 多图评估
+  python app.py --cli -i test_images/ -q "德味"           # 目录+查询
+  python app.py --cli -i test_images/ -I                  # 目录+交互查询
+  OPENAI_API_KEY=sk-xxx python app.py                     # 传 API Key
 """)
     parser.add_argument("--cli", action="store_true",
                        help="CLI 模式 (默认 TUI)")
-    parser.add_argument("--image", "-i", default=None,
-                       help="测试图路径")
+    parser.add_argument("--image", "-i", action="append", default=None,
+                       help="测试图路径/目录（可多次使用）")
     parser.add_argument("--lut-dir", "-d", default=".",
                        help="LUT 目录")
     parser.add_argument("--output", "-o", default="./results",
