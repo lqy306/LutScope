@@ -1145,9 +1145,24 @@ class LutTUI:
     # ----------------------------------------------------------
 
     def run_scan(self):
-        """扫描 LUT 和测试图。"""
-        self.luts = discover_luts(self.lut_dir)
-        self.test_images = discover_all_images([self.lut_dir, "."])
+        """扫描 LUT 和测试图（自动搜索常见子目录）。"""
+        # LUT: 指定目录 + ./luts/
+        lut_dirs = [self.lut_dir]
+        if self.lut_dir != "./luts" and os.path.isdir("./luts"):
+            lut_dirs.append("./luts")
+        self.luts = []
+        seen_lut_names = set()
+        for d in lut_dirs:
+            for lut in discover_luts(d):
+                if lut.name not in seen_lut_names:
+                    seen_lut_names.add(lut.name)
+                    self.luts.append(lut)
+
+        # 图片: 指定目录 + ./test_images/ + .
+        img_dirs = list(set([self.lut_dir, "."]))
+        if os.path.isdir("./test_images"):
+            img_dirs.append("./test_images")
+        self.test_images = discover_all_images(img_dirs)
         # 默认全选
         self.selected_images = set(range(len(self.test_images)))
 
