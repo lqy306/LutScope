@@ -49,6 +49,11 @@ def setup_logging(debug: bool = False, log_path: str = None):
     """初始化日志系统。"""
     global DEBUG_MODE, LOG_FILE
     DEBUG_MODE = debug
+
+    # 关掉 PIL 的调试噪音
+    for noisy in ["PIL", "PIL.PngImagePlugin", "PIL.Image"]:
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     root = logging.getLogger()
     root.setLevel(logging.DEBUG if debug else logging.INFO)
     root.handlers.clear()
@@ -91,6 +96,17 @@ def log(level: str, msg: str, *args):
 _LUT_BINARY_CACHE = None
 
 
+def _in_zipapp() -> bool:
+    """检测是否从 zipapp 单文件运行。"""
+    try:
+        if os.path.isfile(sys.argv[0]):
+            with zipfile.ZipFile(sys.argv[0]) as z:
+                return "__main__.py" in z.namelist()
+    except (zipfile.BadZipFile, FileNotFoundError):
+        pass
+    return False
+
+
 def find_lut_tool() -> str:
     """查找 lut_tool 二进制: 源码 / zipapp / PATH。"""
     global _LUT_BINARY_CACHE
@@ -110,20 +126,20 @@ def find_lut_tool() -> str:
         return _LUT_BINARY_CACHE
 
     # zipapp 内提取
-    if (not __file__.endswith(".py") or
-            (os.path.isfile(sys.argv[0]) and ".pyz" in sys.argv[0])):
+    if _in_zipapp():
         try:
             td = os.path.join(tempfile.gettempdir(), "LutScope")
             os.makedirs(td, exist_ok=True)
             lp = os.path.join(td, "lut_tool")
             if not os.path.exists(lp):
+                log("debug", "Extracting lut_tool from zipapp to %s", lp)
                 with zipfile.ZipFile(sys.argv[0]) as z:
                     z.extract("lut_tool", td)
                 os.chmod(lp, 0o755)
             _LUT_BINARY_CACHE = lp
             return lp
-        except Exception:
-            pass
+        except Exception as e:
+            log("error", "Failed to extract lut_tool from zipapp: %s", e)
 
     return "./lut_tool"
 
